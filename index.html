@@ -57,6 +57,15 @@ async function run() {
   await execute(false);
 }
 
+// Runs a promise with a timeout so a hung execution can never freeze the page
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label + ' timed out after ' + (ms / 1000) + 's')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function execute(retried) {
   const out = document.getElementById('out');
   const btn = document.getElementById('runBtn');
@@ -77,7 +86,7 @@ async function execute(retried) {
       py.setStdout({ batched: s => { stdout += s + '\n'; } });
       py.setStderr({ batched: s => { stderr += s + '\n'; } });
       try {
-        await py.runPythonAsync(code);
+        await withTimeout(py.runPythonAsync(code), 30000, 'Python run');
         lastStderr = stderr;
         failed = !!stderr;
         out.innerHTML = (stdout ? '<span class="ok">' + esc(stdout) + '</span>' : '') +
@@ -141,7 +150,7 @@ async function execute(retried) {
 // Free AI code fixer (Pollinations, no key needed)
 async function aiFix(code, stderr, lang) {
   const prompt = `Fix this ${lang} code. It produced this error:\n${stderr.slice(0, 2000)}\n\nCode:\n${code.slice(0, 4000)}\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.`;
-  const r = await fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' });
+  const r = await withTimeout(fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' }), 60000, 'AI fix');
   if (!r.ok) throw new Error('ai down');
   let text = (await r.text()).trim();
   // strip markdown fences if the model added them
