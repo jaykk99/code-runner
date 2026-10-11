@@ -27,7 +27,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Auto-fix cleans up common errors.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed and re-run on their own.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -54,13 +54,22 @@ async function getPyodide() {
 }
 
 async function run() {
+  await execute(false);
+}
+
+async function execute(retried) {
   const out = document.getElementById('out');
   const btn = document.getElementById('runBtn');
+  const notesEl = document.getElementById('notes');
   const lang = document.getElementById('lang').value;
-  const code = document.getElementById('code').value;
+  const codeEl = document.getElementById('code');
+  const code = codeEl.value;
   btn.disabled = true;
-  out.innerHTML = 'Running...';
-  document.getElementById('notes').textContent = '';
+  if (!retried) {
+    out.innerHTML = 'Running...';
+    notesEl.textContent = '';
+  }
+  let failed = false;
   try {
     if (lang === 'python') {
       const py = await getPyodide();
@@ -70,10 +79,12 @@ async function run() {
       try {
         await py.runPythonAsync(code);
         lastStderr = stderr;
+        failed = !!stderr;
         out.innerHTML = (stdout ? '<span class="ok">' + esc(stdout) + '</span>' : '') +
           (stderr ? '<span class="err">' + esc(stderr) + '</span>' : '') || '(no output)';
       } catch (e) {
         lastStderr = String(e.message || e);
+        failed = true;
         out.innerHTML = '<span class="err">' + esc(lastStderr) + '</span>';
       }
     } else {
@@ -88,11 +99,29 @@ async function run() {
         out.innerHTML = logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>' : '(no output)';
       } catch (e) {
         lastStderr = String((e && e.stack) || e);
+        failed = true;
         out.innerHTML = (logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>\n' : '') +
           '<span class="err">' + esc(lastStderr) + '</span>';
       }
     }
-  } catch(e) { out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>'; }
+  } catch(e) {
+    failed = true;
+    lastStderr = e.message;
+    out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>';
+  }
+  // Automatic fix: on failure, try to repair the code and re-run once
+  if (failed && !retried) {
+    const fixed = lang === 'python' ? autofixPython(code, lastStderr) : autofixJs(code, lastStderr);
+    if (fixed.changed) {
+      codeEl.value = fixed.code;
+      notesEl.innerHTML = '<b>Auto-fixed and re-ran:</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+      btn.disabled = false;
+      await execute(true);
+      return;
+    } else if (fixed.notes.length) {
+      notesEl.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    }
+  }
   btn.disabled = false;
 }
 
@@ -122,8 +151,15 @@ function autofixPython(code, stderr) {
       notes.push(`Added missing 'import ${m[1]}'`);
     }
   }
-  m = stderr.match(/File "<exec>", line (\d+)/) || stderr.match(/line (\d+)/);
-  const errLine = m ? parseInt(m[1]) : null;
+  // Find the user's code line: last <exec> frame in the traceback, else last "line N" anywhere
+  let errLine = null;
+  const execFrames = [...stderr.matchAll(/File "<exec>", line (\d+)/g)];
+  if (execFrames.length) {
+    errLine = parseInt(execFrames[execFrames.length - 1][1]);
+  } else {
+    const allLines = [...stderr.matchAll(/line (\d+)/g)];
+    if (allLines.length) errLine = parseInt(allLines[allLines.length - 1][1]);
+  }
   if (/IndentationError: unexpected indent/.test(stderr) && errLine && errLine <= lines.length) {
     const i = errLine - 1;
     const stripped = lines[i].trimStart();
