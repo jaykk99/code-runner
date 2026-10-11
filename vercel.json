@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/run.py": { "maxDuration": 25, "runtime": "python3.12" },
-    "api/fix.py": { "maxDuration": 10, "runtime": "python3.12" }
+    "api/run.py": { "maxDuration": 25 },
+    "api/fix.py": { "maxDuration": 10 }
   }
 }
