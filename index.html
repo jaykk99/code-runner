@@ -27,7 +27,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed and re-run on their own.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed by AI and re-run on their own.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -109,7 +109,7 @@ async function execute(retried) {
     lastStderr = e.message;
     out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>';
   }
-  // Automatic fix: on failure, try to repair the code and re-run once
+  // Automatic fix: on failure, try rule-based repair first, then free AI, then re-run
   if (failed && !retried) {
     const fixed = lang === 'python' ? autofixPython(code, lastStderr) : autofixJs(code, lastStderr);
     if (fixed.changed) {
@@ -118,23 +118,58 @@ async function execute(retried) {
       btn.disabled = false;
       await execute(true);
       return;
-    } else if (fixed.notes.length) {
-      notesEl.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    }
+    // Rule-based found nothing: ask the free AI
+    notesEl.innerHTML = '<b>AI is fixing the error...</b>';
+    try {
+      const aiCode = await aiFix(code, lastStderr, lang);
+      if (aiCode && aiCode.trim() && aiCode.trim() !== code.trim()) {
+        codeEl.value = aiCode;
+        notesEl.innerHTML = '<b>AI fixed it, re-running...</b>';
+        btn.disabled = false;
+        await execute(true);
+        return;
+      }
+      notesEl.innerHTML = '<b>AI could not fix it.</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    } catch (e) {
+      notesEl.innerHTML = '<b>AI fix unavailable right now.</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
     }
   }
   btn.disabled = false;
 }
 
-function autofix() {
+// Free AI code fixer (Pollinations, no key needed)
+async function aiFix(code, stderr, lang) {
+  const prompt = `Fix this ${lang} code. It produced this error:\n${stderr.slice(0, 2000)}\n\nCode:\n${code.slice(0, 4000)}\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.`;
+  const r = await fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' });
+  if (!r.ok) throw new Error('ai down');
+  let text = (await r.text()).trim();
+  // strip markdown fences if the model added them
+  text = text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+  return text;
+}
+
+async function autofix() {
   const notes = document.getElementById('notes');
   const lang = document.getElementById('lang').value;
   const codeEl = document.getElementById('code');
-  notes.textContent = 'Analyzing...';
+  notes.innerHTML = '<b>Analyzing...</b>';
   const fixed = lang === 'python' ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
   if (fixed.changed) {
     codeEl.value = fixed.code;
     notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>') + '<br><b>Code updated. Hit Run to test the fix.</b>';
-  } else {
+    return;
+  }
+  notes.innerHTML = '<b>AI is fixing the error...</b>';
+  try {
+    const aiCode = await aiFix(codeEl.value, lastStderr, lang);
+    if (aiCode && aiCode.trim() && aiCode.trim() !== codeEl.value.trim()) {
+      codeEl.value = aiCode;
+      notes.innerHTML = '<b>AI fixed it. Hit Run to test.</b>';
+    } else {
+      notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    }
+  } catch (e) {
     notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
   }
 }
