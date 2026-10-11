@@ -3,35 +3,32 @@ import subprocess
 import tempfile
 import os
 import sys
-from http.server import BaseHTTPRequestHandler
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            return self._send(400, {"error": "bad request"})
-        language = body.get("language", "python")
-        code = body.get("code", "")
-        if not code or len(code) > 100000:
-            return self._send(400, {"error": "code required (max 100k chars)"})
-        if language == "python":
-            result = run_python(code)
-        elif language == "javascript":
-            result = run_js(code)
-        else:
-            return self._send(400, {"error": "language must be python or javascript"})
-        return self._send(200, result)
+def handler(request):
+    try:
+        body = json.loads(request.body or b"{}") if hasattr(request, "body") else {}
+    except Exception:
+        return resp(400, {"error": "bad request"})
+    language = body.get("language", "python")
+    code = body.get("code", "")
+    if not code or len(code) > 100000:
+        return resp(400, {"error": "code required (max 100k chars)"})
+    if language == "python":
+        result = run_python(code)
+    elif language == "javascript":
+        result = run_js(code)
+    else:
+        return resp(400, {"error": "language must be python or javascript"})
+    return resp(200, result)
 
-    def _send(self, status, obj):
-        data = json.dumps(obj).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+
+def resp(status, obj):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(obj),
+    }
 
 
 def run_python(code):
