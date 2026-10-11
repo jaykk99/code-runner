@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Runner</title>
+<style>
+  body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }
+  main { max-width:900px; margin:0 auto; }
+  h1 { color:#fff; margin-bottom:4px; }
+  .sub { color:#64748b; font-size:14px; margin-bottom:16px; }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  select { background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:10px 14px; font-size:15px; }
+  button { background:#22d3ee; color:#0b1220; border:0; border-radius:8px; padding:10px 24px;
+    font-size:15px; font-weight:700; cursor:pointer; }
+  button.ghost { background:#1e293b; color:#22d3ee; border:1px solid #334155; }
+  button:disabled { opacity:.5; }
+  textarea { width:100%; height:320px; background:#0b1220; color:#e2e8f0; border:1px solid #334155;
+    border-radius:8px; padding:14px; font-family:monospace; font-size:14px; box-sizing:border-box; resize:vertical; }
+  #out { margin-top:16px; background:#0b1220; border:1px solid #334155; border-radius:8px; padding:16px;
+    white-space:pre-wrap; word-break:break-word; font-family:monospace; font-size:13px; min-height:80px; }
+  #notes { margin-top:12px; color:#a78bfa; font-size:14px; }
+  .err { color:#f87171; } .ok { color:#4ade80; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Code Runner</h1>
+  <div class="sub">Run Python or JavaScript in the cloud. Auto-fix cleans up common errors.</div>
+  <div class="row">
+    <select id="lang">
+      <option value="python">Python</option>
+      <option value="javascript">JavaScript</option>
+    </select>
+    <button id="runBtn" onclick="run()">Run</button>
+    <button id="fixBtn" class="ghost" onclick="autofix()">Auto-fix errors</button>
+    <button class="ghost" onclick="clearAll()">Clear</button>
+  </div>
+  <textarea id="code" spellcheck="false" placeholder="print('hello world')"></textarea>
+  <div id="notes"></div>
+  <div id="out">Output appears here.</div>
+</main>
+<script>
+let lastStderr = '';
+async function run() {
+  const out = document.getElementById('out');
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  out.innerHTML = 'Running...';
+  document.getElementById('notes').textContent = '';
+  try {
+    const r = await fetch('/api/run', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: document.getElementById('lang').value, code: document.getElementById('code').value })
+    });
+    const j = await r.json();
+    lastStderr = j.stderr || '';
+    let html = '';
+    if (j.stdout) html += '<span class="ok">' + esc(j.stdout) + '</span>';
+    if (j.stderr) html += '<span class="err">' + esc(j.stderr) + '</span>';
+    if (!j.stdout && !j.stderr) html = '(no output, exit ' + j.exitCode + ')';
+    out.innerHTML = html;
+  } catch(e) { out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>'; }
+  btn.disabled = false;
+}
+async function autofix() {
+  const notes = document.getElementById('notes');
+  notes.textContent = 'Analyzing...';
+  try {
+    const r = await fetch('/api/fix', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ language: document.getElementById('lang').value,
+        code: document.getElementById('code').value, stderr: lastStderr })
+    });
+    const j = await r.json();
+    notes.innerHTML = j.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    if (j.changed) {
+      document.getElementById('code').value = j.fixed;
+      notes.innerHTML += '<br><b>Code updated. Hit Run to test the fix.</b>';
+    }
+  } catch(e) { notes.textContent = 'Error: ' + e.message; }
+}
+function clearAll() {
+  document.getElementById('code').value = '';
+  document.getElementById('out').textContent = 'Output appears here.';
+  document.getElementById('notes').textContent = '';
+  lastStderr = '';
+}
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+document.getElementById('lang').addEventListener('change', e => {
+  document.getElementById('code').placeholder = e.target.value === 'python' ? "print('hello world')" : "console.log('hello world');";
+});
+</script>
+</body>
+</html>
