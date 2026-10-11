@@ -22,12 +22,11 @@
   #notes { margin-top:12px; color:#a78bfa; font-size:14px; }
   .err { color:#f87171; } .ok { color:#4ade80; }
 </style>
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 </head>
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed by AI and re-run on their own.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -42,202 +41,337 @@
   <div id="out">Output appears here.</div>
 </main>
 <script>
-let lastStderr = '';
-let pyodide = null;
+'use strict';
+var lastStderr = '';
 
-async function getPyodide() {
-  if (!pyodide) {
-    document.getElementById('out').textContent = 'Loading Python runtime (first run only)...';
-    pyodide = await loadPyodide();
-  }
-  return pyodide;
-}
+// ---------------------------------------------------------------------------
+// Execution engine: every run happens inside a Web Worker. If the code hangs
+// (infinite loop, blocking call), the worker is terminated on timeout, so the
+// page can never freeze. This replaces the old Promise.race approach, which
+// could not interrupt code already running on the main thread.
+// ---------------------------------------------------------------------------
+var PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
+var PYTHON_TIMEOUT_MS = 30000;
+var JS_TIMEOUT_MS = 10000;
 
-async function run() {
-  await execute(false);
-}
+var pythonWorkerSrc = [
+  "importScripts('" + PYODIDE_CDN + "');",
+  "var pyodideReady = null;",
+  "function ensurePyodide() {",
+  "  if (!pyodideReady) pyodideReady = loadPyodide();",
+  "  return pyodideReady;",
+  "}",
+  "onmessage = function(e) {",
+  "  var code = e.data.code;",
+  "  ensurePyodide().then(function(py) {",
+  "    var stdout = '', stderr = '';",
+  "    py.setStdout({ batched: function(s) { stdout += s + '\\n'; } });",
+  "    py.setStderr({ batched: function(s) { stderr += s + '\\n'; } });",
+  "    var p;",
+  "    try { p = py.runPythonAsync(code); }",
+  "    catch (err) { postMessage({ ok: false, output: '', error: String((err && err.message) || err) }); return; }",
+  "    p.then(function() { postMessage({ ok: true, output: stdout, error: stderr }); },",
+  "           function(err) { postMessage({ ok: false, output: stdout, error: String((err && err.message) || err) }); });",
+  "  }, function(err) {",
+  "    postMessage({ ok: false, output: '', error: 'Python runtime failed to load: ' + String((err && err.message) || err) });",
+  "  });",
+  "};"
+].join('\n');
 
-// Runs a promise with a timeout so a hung execution can never freeze the page
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(label + ' timed out after ' + (ms / 1000) + 's')), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
+var jsWorkerSrc = [
+  "onmessage = function(e) {",
+  "  var logs = [];",
+  "  function push(args) { logs.push(Array.prototype.map.call(args, String).join(' ')); }",
+  "  var fakeConsole = { log: function(){ push(arguments); }, error: function(){ push(arguments); }, warn: function(){ push(arguments); } };",
+  "  var fn;",
+  "  try { fn = new (Object.getPrototypeOf(async function(){}).constructor)('console', e.data.code); }",
+  "  catch (err) { postMessage({ ok: false, output: '', error: String((err && err.stack) || err) }); return; }",
+  "  var r;",
+  "  try { r = fn(fakeConsole); }",
+  "  catch (err) { postMessage({ ok: false, output: logs.join('\\n'), error: String((err && err.stack) || err) }); return; }",
+  "  Promise.resolve(r).then(function() { postMessage({ ok: true, output: logs.join('\\n'), error: '' }); },",
+  "    function(err) { postMessage({ ok: false, output: logs.join('\\n'), error: String((err && err.stack) || err) }); });",
+  "};"
+].join('\n');
 
-async function execute(retried) {
-  const out = document.getElementById('out');
-  const btn = document.getElementById('runBtn');
-  const notesEl = document.getElementById('notes');
-  const lang = document.getElementById('lang').value;
-  const codeEl = document.getElementById('code');
-  const code = codeEl.value;
-  btn.disabled = true;
-  if (!retried) {
-    out.innerHTML = 'Running...';
-    notesEl.textContent = '';
-  }
-  let failed = false;
-  try {
-    if (lang === 'python') {
-      const py = await getPyodide();
-      let stdout = '', stderr = '';
-      py.setStdout({ batched: s => { stdout += s + '\n'; } });
-      py.setStderr({ batched: s => { stderr += s + '\n'; } });
-      try {
-        await withTimeout(py.runPythonAsync(code), 30000, 'Python run');
-        lastStderr = stderr;
-        failed = !!stderr;
-        out.innerHTML = (stdout ? '<span class="ok">' + esc(stdout) + '</span>' : '') +
-          (stderr ? '<span class="err">' + esc(stderr) + '</span>' : '') || '(no output)';
-      } catch (e) {
-        lastStderr = String(e.message || e);
-        failed = true;
-        out.innerHTML = '<span class="err">' + esc(lastStderr) + '</span>';
-      }
-    } else {
-      const logs = [];
-      const fakeConsole = { log: (...a) => logs.push(a.map(String).join(' ')),
-        error: (...a) => logs.push(a.map(String).join(' ')),
-        warn: (...a) => logs.push(a.map(String).join(' ')) };
-      try {
-        const fn = new (Object.getPrototypeOf(async function(){}).constructor)('console', code);
-        await fn(fakeConsole);
-        lastStderr = '';
-        out.innerHTML = logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>' : '(no output)';
-      } catch (e) {
-        lastStderr = String((e && e.stack) || e);
-        failed = true;
-        out.innerHTML = (logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>\n' : '') +
-          '<span class="err">' + esc(lastStderr) + '</span>';
-      }
+// A reusable worker slot: the worker stays alive between runs for speed, and
+// is destroyed + recreated only when a timeout kills it.
+function makeRunner(workerSrc, timeoutMs, label) {
+  var worker = null;
+  function getWorker() {
+    if (!worker) {
+      worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })));
     }
-  } catch(e) {
-    failed = true;
-    lastStderr = e.message;
-    out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>';
+    return worker;
   }
-  // Automatic fix: on failure, try rule-based repair first, then free AI, then re-run
-  if (failed && !retried) {
-    const fixed = lang === 'python' ? autofixPython(code, lastStderr) : autofixJs(code, lastStderr);
-    if (fixed.changed) {
-      codeEl.value = fixed.code;
-      notesEl.innerHTML = '<b>Auto-fixed and re-ran:</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
-      btn.disabled = false;
-      await execute(true);
+  return function run(code) {
+    return new Promise(function(resolve, reject) {
+      var w;
+      try { w = getWorker(); } catch (e) {
+        reject(new Error(label + ' could not start: ' + (e.message || e)));
+        return;
+      }
+      var done = false;
+      var timer = setTimeout(function() {
+        if (done) return;
+        done = true;
+        try { w.terminate(); } catch (e) {}
+        worker = null; // timed-out worker is dead; next run gets a fresh one
+        reject(new Error(label + ' timed out after ' + (timeoutMs / 1000) + 's and was stopped'));
+      }, timeoutMs);
+      function cleanup() {
+        clearTimeout(timer);
+        w.removeEventListener('message', onMsg);
+        w.removeEventListener('error', onErr);
+      }
+      function onMsg(e) {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(e.data);
+      }
+      function onErr(e) {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error(label + ' crashed: ' + ((e && e.message) || 'worker error')));
+      }
+      w.addEventListener('message', onMsg);
+      w.addEventListener('error', onErr);
+      try { w.postMessage({ code: code }); }
+      catch (e) {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error(label + ' could not receive code: ' + (e.message || e)));
+      }
+    });
+  };
+}
+
+var runPython = makeRunner(pythonWorkerSrc, PYTHON_TIMEOUT_MS, 'Python run');
+var runJs = makeRunner(jsWorkerSrc, JS_TIMEOUT_MS, 'JavaScript run');
+var pythonRuntimeReady = false;
+
+// Runs a promise with a timeout (used for network calls, where aborting is safe).
+function withTimeout(promise, ms, label) {
+  var timer;
+  var timeout = new Promise(function(_, reject) {
+    timer = setTimeout(function() { reject(new Error(label + ' timed out after ' + (ms / 1000) + 's')); }, ms);
+  });
+  return Promise.race([promise, timeout]).then(
+    function(v) { clearTimeout(timer); return v; },
+    function(e) { clearTimeout(timer); throw e; }
+  );
+}
+
+function run() { execute(false); }
+
+async function execute(isRetry) {
+  var out = document.getElementById('out');
+  var btn = document.getElementById('runBtn');
+  var notesEl = document.getElementById('notes');
+  var lang = document.getElementById('lang').value;
+  var codeEl = document.getElementById('code');
+  btn.disabled = true;
+  try {
+    if (!isRetry) {
+      out.innerHTML = (lang === 'python' && !pythonRuntimeReady)
+        ? 'Loading Python runtime (first run only)...'
+        : 'Running...';
+      notesEl.textContent = '';
+    } else {
+      out.innerHTML = 'Re-running fixed code...';
+    }
+    var res;
+    try {
+      res = (lang === 'python') ? await runPython(codeEl.value) : await runJs(codeEl.value);
+      if (lang === 'python') pythonRuntimeReady = true;
+    } catch (e) {
+      // Worker-level failure: timeout kill, crash, or startup error.
+      lastStderr = e.message || String(e);
+      out.innerHTML = '<span class="err">' + esc(lastStderr) + '</span>';
+      notesEl.innerHTML = /timed out/.test(lastStderr)
+        ? 'The runaway code was killed. Fix the loop and run again.'
+        : '';
       return;
     }
-    // Rule-based found nothing: ask the free AI
-    notesEl.innerHTML = '<b>AI is fixing the error...</b>';
-    try {
-      const aiCode = await aiFix(code, lastStderr, lang);
-      if (aiCode && aiCode.trim() && aiCode.trim() !== code.trim()) {
-        codeEl.value = aiCode;
-        notesEl.innerHTML = '<b>AI fixed it, re-running...</b>';
-        btn.disabled = false;
+    var failed = !res.ok || !!res.error;
+    lastStderr = res.ok ? (res.error || '') : (res.error || 'Unknown error');
+    if (res.ok && !res.error) {
+      out.innerHTML = res.output ? '<span class="ok">' + esc(res.output) + '</span>' : '(no output)';
+    } else {
+      out.innerHTML = (res.output ? '<span class="ok">' + esc(res.output) + '</span>\n' : '') +
+        '<span class="err">' + esc(lastStderr) + '</span>';
+    }
+    // Automatic fix: on failure, try rule-based repair first, then free AI, then re-run once.
+    if (failed && !isRetry) {
+      var fixed = (lang === 'python') ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
+      if (fixed.changed) {
+        codeEl.value = fixed.code;
+        notesEl.innerHTML = '<b>Auto-fixed and re-running:</b><br>' + fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
         await execute(true);
         return;
       }
-      notesEl.innerHTML = '<b>AI could not fix it.</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
-    } catch (e) {
-      notesEl.innerHTML = '<b>AI fix unavailable right now.</b><br>' + fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+      notesEl.innerHTML = '<b>AI is fixing the error...</b>';
+      try {
+        var aiCode = await aiFix(codeEl.value, lastStderr, lang);
+        if (aiCode && aiCode.trim() && aiCode.trim() !== codeEl.value.trim()) {
+          codeEl.value = aiCode;
+          notesEl.innerHTML = '<b>AI fixed it, re-running...</b>';
+          await execute(true);
+          return;
+        }
+        notesEl.innerHTML = '<b>AI could not fix it.</b><br>' + fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
+      } catch (e) {
+        // Surface the REAL reason instead of a generic message.
+        notesEl.innerHTML = '<b>AI fix failed:</b> ' + esc(e.message || String(e)) + '<br>' +
+          fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
+      }
     }
+  } finally {
+    btn.disabled = false; // always re-enable, even if something throws
   }
-  btn.disabled = false;
 }
 
-// Free AI code fixer (Pollinations, no key needed)
+// ---------------------------------------------------------------------------
+// Free AI code fixer (Pollinations, no key needed).
+// Method 1 (primary): POST to the OpenAI-compatible endpoint with a JSON body.
+//   This avoids stuffing the whole prompt into a URL, which was flaky.
+// Method 2 (fallback): the original GET endpoint.
+// Both are tried before giving up, and the real error is surfaced.
+// ---------------------------------------------------------------------------
+function cleanAiCode(text) {
+  return text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+}
+
 async function aiFix(code, stderr, lang) {
-  const prompt = `Fix this ${lang} code. It produced this error:\n${stderr.slice(0, 2000)}\n\nCode:\n${code.slice(0, 4000)}\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.`;
-  const r = await withTimeout(fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' }), 60000, 'AI fix');
-  if (!r.ok) throw new Error('ai down');
-  let text = (await r.text()).trim();
-  // strip markdown fences if the model added them
-  text = text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
-  return text;
+  var prompt = 'Fix this ' + lang + ' code. It produced this error:\n' +
+    stderr.slice(0, 2000) + '\n\nCode:\n' + code.slice(0, 4000) +
+    '\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.';
+  var errors = [];
+  // Method 1: POST, OpenAI-compatible.
+  try {
+    var r = await withTimeout(fetch('https://text.pollinations.ai/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 2000
+      })
+    }), 60000, 'AI fix');
+    if (!r.ok) throw new Error('AI service returned HTTP ' + r.status);
+    var data = await r.json();
+    var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!text || !text.trim()) throw new Error('AI returned an empty response');
+    return cleanAiCode(text);
+  } catch (e) {
+    errors.push('POST: ' + (e.message || e));
+  }
+  // Method 2: GET fallback.
+  try {
+    var r2 = await withTimeout(fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' }), 60000, 'AI fix fallback');
+    if (!r2.ok) throw new Error('AI service returned HTTP ' + r2.status);
+    var text2 = (await r2.text()).trim();
+    if (!text2) throw new Error('AI returned an empty response');
+    return cleanAiCode(text2);
+  } catch (e2) {
+    errors.push('GET: ' + (e2.message || e2));
+  }
+  throw new Error(errors.join(' | ') + ' - check your connection and try again');
 }
 
 async function autofix() {
-  const notes = document.getElementById('notes');
-  const lang = document.getElementById('lang').value;
-  const codeEl = document.getElementById('code');
+  var notes = document.getElementById('notes');
+  var lang = document.getElementById('lang').value;
+  var codeEl = document.getElementById('code');
   notes.innerHTML = '<b>Analyzing...</b>';
-  const fixed = lang === 'python' ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
+  var fixed = (lang === 'python') ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
   if (fixed.changed) {
     codeEl.value = fixed.code;
-    notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>') + '<br><b>Code updated. Hit Run to test the fix.</b>';
+    notes.innerHTML = fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>') + '<br><b>Code updated. Hit Run to test the fix.</b>';
     return;
   }
   notes.innerHTML = '<b>AI is fixing the error...</b>';
   try {
-    const aiCode = await aiFix(codeEl.value, lastStderr, lang);
+    var aiCode = await aiFix(codeEl.value, lastStderr, lang);
     if (aiCode && aiCode.trim() && aiCode.trim() !== codeEl.value.trim()) {
       codeEl.value = aiCode;
       notes.innerHTML = '<b>AI fixed it. Hit Run to test.</b>';
     } else {
-      notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+      notes.innerHTML = '<b>AI could not fix it.</b><br>' + fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
     }
   } catch (e) {
-    notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    notes.innerHTML = '<b>AI fix failed:</b> ' + esc(e.message || String(e)) + '<br>' +
+      fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
   }
 }
 
 function autofixPython(code, stderr) {
-  const notes = [];
-  let lines = code.split('\n');
-  let m = stderr.match(/ModuleNotFoundError: No module named '([^']+)'/);
-  if (m) notes.push(`Missing module '${m[1]}'. Browser Python can't pip install; stick to built-in modules (json, re, math, random, datetime).`);
+  var notes = [];
+  var lines = code.split('\n');
+  var m = stderr.match(/ModuleNotFoundError: No module named '([^']+)'/);
+  if (m) {
+    if (m[1] === 'requests') {
+      notes.push("Browser Python can't pip install 'requests'. The AI fixer can rewrite this to use urllib (built-in).");
+    } else {
+      notes.push("Missing module '" + m[1] + "'. Browser Python can't pip install; stick to built-in modules (json, re, math, random, datetime, collections, itertools, hashlib, base64).");
+    }
+  }
+  if (/EOFError|StdinNotImplementedError/i.test(stderr) || (/input\(\)/.test(code) && /EOF/.test(stderr))) {
+    notes.push('input() does not work in the browser. Hardcode the value instead of reading input.');
+  }
   m = stderr.match(/NameError: name '(\w+)' is not defined/);
-  if (m && ['json','re','os','sys','math','time','random','datetime'].includes(m[1])) {
-    if (!new RegExp(`^import\\s+${m[1]}\\b`, 'm').test(code)) {
-      lines.unshift(`import ${m[1]}`);
-      notes.push(`Added missing 'import ${m[1]}'`);
+  if (m && ['json','re','os','sys','math','time','random','datetime','collections','itertools','functools','hashlib','base64'].indexOf(m[1]) !== -1) {
+    if (!new RegExp('^import\\s+' + m[1] + '\\b', 'm').test(code)) {
+      lines.unshift('import ' + m[1]);
+      notes.push("Added missing 'import " + m[1] + "'");
     }
   }
   // Find the user's code line: last <exec> frame in the traceback, else last "line N" anywhere
-  let errLine = null;
-  const execFrames = [...stderr.matchAll(/File "<exec>", line (\d+)/g)];
+  var errLine = null;
+  var execFrames = stderr.match(/File "<exec>", line (\d+)/g) || [];
   if (execFrames.length) {
-    errLine = parseInt(execFrames[execFrames.length - 1][1]);
+    errLine = parseInt(execFrames[execFrames.length - 1].match(/line (\d+)/)[1], 10);
   } else {
-    const allLines = [...stderr.matchAll(/line (\d+)/g)];
-    if (allLines.length) errLine = parseInt(allLines[allLines.length - 1][1]);
+    var allLines = stderr.match(/line (\d+)/g) || [];
+    if (allLines.length) errLine = parseInt(allLines[allLines.length - 1].match(/line (\d+)/)[1], 10);
   }
   if (/IndentationError: unexpected indent/.test(stderr) && errLine && errLine <= lines.length) {
-    const i = errLine - 1;
-    const stripped = lines[i].trimStart();
-    let prev = '';
-    for (let j = i - 1; j >= 0; j--) {
+    var i = errLine - 1;
+    var stripped = lines[i].replace(/^\s+/, '');
+    var prev = '';
+    for (var j = i - 1; j >= 0; j--) {
       if (lines[j].trim()) { prev = lines[j].match(/^\s*/)[0]; break; }
     }
     lines[i] = prev + stripped;
-    notes.push(`Fixed unexpected indent on line ${errLine}`);
+    notes.push('Fixed unexpected indent on line ' + errLine);
   }
-  if (/TabError/.test(stderr)) { lines = lines.map(l => l.replace(/\t/g, '    ')); notes.push('Converted tabs to 4 spaces'); }
+  if (/TabError/.test(stderr)) { lines = lines.map(function(l){ return l.replace(/\t/g, '    '); }); notes.push('Converted tabs to 4 spaces'); }
   if (/SyntaxError/.test(stderr) && errLine && errLine <= lines.length) {
-    const i = errLine - 1;
-    const s = lines[i].trimEnd();
-    if (/^\s*(if|elif|else|for|while|def|class|try|except|finally|with)\b/.test(s) && !s.endsWith(':')) {
-      lines[i] = s + ':';
-      notes.push(`Added missing colon on line ${errLine}`);
+    var k = errLine - 1;
+    var s = lines[k].replace(/\s+$/, '');
+    if (/^\s*(if|elif|else|for|while|def|class|try|except|finally|with)\b/.test(s) && !/:$/.test(s)) {
+      lines[k] = s + ':';
+      notes.push('Added missing colon on line ' + errLine);
     }
   }
-  const fixed = lines.join('\n');
+  var fixed = lines.join('\n');
   if (fixed === code && !notes.length) notes.push('No automatic fix found. The error type and line number point at the problem.');
-  return { code: fixed, notes, changed: fixed !== code };
+  return { code: fixed, notes: notes, changed: fixed !== code };
 }
 
 function autofixJs(code, stderr) {
-  const notes = [];
-  let m = stderr.match(/SyntaxError: Unexpected token '([^']+)'/);
-  if (m) notes.push(`Syntax error near '${m[1]}'. Check for unclosed brackets, quotes, or a typo on that line.`);
+  var notes = [];
+  var m = stderr.match(/SyntaxError: Unexpected token '([^']+)'/);
+  if (m) notes.push("Syntax error near '" + m[1] + "'. Check for unclosed brackets, quotes, or a typo on that line.");
   m = stderr.match(/(\w+) is not defined/);
-  if (m) notes.push(`'${m[1]}' is not defined. Check the spelling or declare it first.`);
+  if (m) notes.push("'" + m[1] + "' is not defined. Check the spelling or declare it first.");
   m = stderr.match(/TypeError: ([^\n]+)/);
-  if (m) notes.push(`Type error: ${m[1]}. Check that values are the type the code expects.`);
+  if (m) notes.push('Type error: ' + m[1] + '. Check that values are the type the code expects.');
   if (!notes.length) notes.push('No automatic fix found. The error message and line number point at the problem.');
-  return { code, notes, changed: false };
+  return { code: code, notes: notes, changed: false };
 }
 
 function clearAll() {
@@ -246,8 +380,8 @@ function clearAll() {
   document.getElementById('notes').textContent = '';
   lastStderr = '';
 }
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-document.getElementById('lang').addEventListener('change', e => {
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+document.getElementById('lang').addEventListener('change', function(e) {
   document.getElementById('code').placeholder = e.target.value === 'python' ? "print('hello world')" : "console.log('hello world');";
 });
 </script>
