@@ -1,6 +1,1 @@
-{
-  "functions": {
-    "api/run.py": { "maxDuration": 25 },
-    "api/fix.py": { "maxDuration": 10 }
-  }
-}
+{ "functions": { "api/run.js": { "maxDuration": 25 }, "api/fix.js": { "maxDuration": 10 } } }
