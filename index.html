@@ -246,8 +246,11 @@ function cleanAiCode(text) {
 }
 
 async function aiFix(code, stderr, lang) {
+  var envNote = lang === 'python'
+    ? '\n\nENVIRONMENT: this code runs in a browser via Pyodide. There is NO pip and NO micropip. Only the Python standard library is available (json, re, math, random, datetime, urllib, etc). If the code imports a third-party package like requests, rewrite it using only the standard library (e.g. urllib.request instead of requests). Never suggest pip install or micropip.'
+    : '\n\nENVIRONMENT: this code runs in a browser sandbox. No Node.js APIs, no require(), no file system access. Use only standard browser JavaScript.';
   var prompt = 'Fix this ' + lang + ' code. It produced this error:\n' +
-    stderr.slice(0, 2000) + '\n\nCode:\n' + code.slice(0, 4000) +
+    stderr.slice(0, 2000) + '\n\nCode:\n' + code.slice(0, 4000) + envNote +
     '\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.';
   var errors = [];
   // Method 1: POST, OpenAI-compatible.
