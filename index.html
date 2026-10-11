@@ -122,7 +122,7 @@ function autofixPython(code, stderr) {
       notes.push(`Added missing 'import ${m[1]}'`);
     }
   }
-  m = stderr.match(/line (\d+)/);
+  m = stderr.match(/File "<exec>", line (\d+)/) || stderr.match(/line (\d+)/);
   const errLine = m ? parseInt(m[1]) : null;
   if (/IndentationError: unexpected indent/.test(stderr) && errLine && errLine <= lines.length) {
     const i = errLine - 1;
