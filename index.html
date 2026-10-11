@@ -27,7 +27,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript. Auto-fix cleans up common errors.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Auto-fix cleans up common errors.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -44,6 +44,7 @@
 <script>
 let lastStderr = '';
 let pyodide = null;
+
 async function getPyodide() {
   if (!pyodide) {
     document.getElementById('out').textContent = 'Loading Python runtime (first run only)...';
@@ -51,6 +52,7 @@ async function getPyodide() {
   }
   return pyodide;
 }
+
 async function run() {
   const out = document.getElementById('out');
   const btn = document.getElementById('runBtn');
@@ -62,8 +64,6 @@ async function run() {
   try {
     if (lang === 'python') {
       const py = await getPyodide();
-      py.setStdout({ batched: s => {} });
-      py.setStderr({ batched: s => {} });
       let stdout = '', stderr = '';
       py.setStdout({ batched: s => { stdout += s + '\n'; } });
       py.setStderr({ batched: s => { stderr += s + '\n'; } });
@@ -77,50 +77,44 @@ async function run() {
         out.innerHTML = '<span class="err">' + esc(lastStderr) + '</span>';
       }
     } else {
-      const r = await fetch('/api/run', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ code })
-      });
-      const j = await r.json();
-      lastStderr = j.stderr || '';
-      let html = '';
-      if (j.stdout) html += '<span class="ok">' + esc(j.stdout) + '</span>';
-      if (j.stderr) html += '<span class="err">' + esc(j.stderr) + '</span>';
-      if (!j.stdout && !j.stderr) html = '(no output, exit ' + j.exitCode + ')';
-      out.innerHTML = html;
+      const logs = [];
+      const fakeConsole = { log: (...a) => logs.push(a.map(String).join(' ')),
+        error: (...a) => logs.push(a.map(String).join(' ')),
+        warn: (...a) => logs.push(a.map(String).join(' ')) };
+      try {
+        const fn = new (Object.getPrototypeOf(async function(){}).constructor)('console', code);
+        await fn(fakeConsole);
+        lastStderr = '';
+        out.innerHTML = logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>' : '(no output)';
+      } catch (e) {
+        lastStderr = String((e && e.stack) || e);
+        out.innerHTML = (logs.length ? '<span class="ok">' + esc(logs.join('\n')) + '</span>\n' : '') +
+          '<span class="err">' + esc(lastStderr) + '</span>';
+      }
     }
   } catch(e) { out.innerHTML = '<span class="err">Error: ' + esc(e.message) + '</span>'; }
   btn.disabled = false;
 }
-async function autofix() {
+
+function autofix() {
   const notes = document.getElementById('notes');
   const lang = document.getElementById('lang').value;
   const codeEl = document.getElementById('code');
   notes.textContent = 'Analyzing...';
-  try {
-    if (lang === 'python') {
-      const fixed = autofixPython(codeEl.value, lastStderr);
-      if (fixed.changed) {
-        codeEl.value = fixed.code;
-        notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>') + '<br><b>Code updated. Hit Run to test the fix.</b>';
-      } else {
-        notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
-      }
-    } else {
-      const r = await fetch('/api/fix', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ code: codeEl.value, stderr: lastStderr })
-      });
-      const j = await r.json();
-      notes.innerHTML = j.notes.map(n => '&bull; ' + esc(n)).join('<br>');
-    }
-  } catch(e) { notes.textContent = 'Error: ' + e.message; }
+  const fixed = lang === 'python' ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
+  if (fixed.changed) {
+    codeEl.value = fixed.code;
+    notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>') + '<br><b>Code updated. Hit Run to test the fix.</b>';
+  } else {
+    notes.innerHTML = fixed.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+  }
 }
+
 function autofixPython(code, stderr) {
   const notes = [];
   let lines = code.split('\n');
   let m = stderr.match(/ModuleNotFoundError: No module named '([^']+)'/);
-  if (m) notes.push(`Missing module '${m[1]}'. Browser Python can't pip install; use a built-in module.`);
+  if (m) notes.push(`Missing module '${m[1]}'. Browser Python can't pip install; stick to built-in modules (json, re, math, random, datetime).`);
   m = stderr.match(/NameError: name '(\w+)' is not defined/);
   if (m && ['json','re','os','sys','math','time','random','datetime'].includes(m[1])) {
     if (!new RegExp(`^import\\s+${m[1]}\\b`, 'm').test(code)) {
@@ -153,6 +147,19 @@ function autofixPython(code, stderr) {
   if (fixed === code && !notes.length) notes.push('No automatic fix found. The error type and line number point at the problem.');
   return { code: fixed, notes, changed: fixed !== code };
 }
+
+function autofixJs(code, stderr) {
+  const notes = [];
+  let m = stderr.match(/SyntaxError: Unexpected token '([^']+)'/);
+  if (m) notes.push(`Syntax error near '${m[1]}'. Check for unclosed brackets, quotes, or a typo on that line.`);
+  m = stderr.match(/(\w+) is not defined/);
+  if (m) notes.push(`'${m[1]}' is not defined. Check the spelling or declare it first.`);
+  m = stderr.match(/TypeError: ([^\n]+)/);
+  if (m) notes.push(`Type error: ${m[1]}. Check that values are the type the code expects.`);
+  if (!notes.length) notes.push('No automatic fix found. The error message and line number point at the problem.');
+  return { code, notes, changed: false };
+}
+
 function clearAll() {
   document.getElementById('code').value = '';
   document.getElementById('out').textContent = 'Output appears here.';
