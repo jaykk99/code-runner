@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Code Runner</title>
+<!-- Code Runner build 2026-10-29.2: python http bridge (requests/urllib), package auto-load incl. sqlite3, AI-fix POST retry, download button -->
 <style>
   body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }
   main { max-width:900px; margin:0 auto; }
@@ -26,7 +27,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Python gets sqlite3, requests and urllib out of the box. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -34,6 +35,7 @@
     </select>
     <button id="runBtn" onclick="run()">Run</button>
     <button id="fixBtn" class="ghost" onclick="autofix()">Auto-fix errors</button>
+    <button class="ghost" onclick="downloadCode()">Download</button>
     <button class="ghost" onclick="clearAll()">Clear</button>
   </div>
   <textarea id="code" spellcheck="false" placeholder="print('hello world')"></textarea>
@@ -51,27 +53,319 @@ var lastStderr = '';
 // could not interrupt code already running on the main thread.
 // ---------------------------------------------------------------------------
 var PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
-var PYTHON_TIMEOUT_MS = 30000;
+var PYTHON_TIMEOUT_MS = 60000;
 var JS_TIMEOUT_MS = 10000;
+
+// ---------------------------------------------------------------------------
+// Python prelude, installed inside Pyodide before user code runs.
+// Pyodide has no sockets: its urllib ships without any HTTP handlers
+// (urlopen dies with "unknown url type: https") and requests is not
+// importable. The prelude routes both through the browser's own network
+// stack via a synchronous XMLHttpRequest bridge living in the worker
+// (sync XHR is allowed in workers). CORS still applies: a site that does
+// not send Access-Control-Allow-Origin cannot be fetched, and the error
+// messages say so instead of blaming the user's code.
+// Written without backslashes/backticks on purpose (template literal).
+// ---------------------------------------------------------------------------
+var PY_PRELUDE = `
+import sys as _cr_sys
+import json as _cr_json
+
+try:
+    from js import __crXhrFetch as _cr_xhr
+except Exception:
+    _cr_xhr = None
+
+_CR_CORS_HINT = ('The browser blocked the request before a usable response came back. '
+                 'This usually means the target site does not allow requests from web '
+                 'pages (missing CORS permission), the address is wrong, or the '
+                 'connection dropped. It is not a bug in your code.')
+
+def _cr_fetch(method, url, headers=None, body=None):
+    if _cr_xhr is None:
+        raise OSError('Networking is not available in this Python session.')
+    raw = _cr_xhr(method, url, _cr_json.dumps(headers or {}), body)
+    return _cr_json.loads(raw)
+
+def _cr_parse_headers(raw):
+    headers = {}
+    for line in (raw or '').splitlines():
+        if ': ' in line:
+            k, v = line.split(': ', 1)
+            headers[k.strip()] = v.strip()
+    return headers
+
+def _cr_has_ct(hdrs):
+    return any(k.lower() == 'content-type' for k in hdrs)
+
+# ---------------- requests (browser bridge implementation) ----------------
+try:
+    import requests as _cr_real_requests
+except Exception:
+    _cr_real_requests = None
+
+if _cr_real_requests is None:
+    import types as _cr_types
+    import urllib.parse as _cr_uparse
+
+    class _CrRequestException(IOError):
+        pass
+    class _CrConnectionError(_CrRequestException):
+        pass
+    class _CrHTTPError(_CrRequestException):
+        pass
+    class _CrTimeout(_CrRequestException):
+        pass
+    _CrRequestException.__name__ = 'RequestException'
+    _CrConnectionError.__name__ = 'ConnectionError'
+    _CrHTTPError.__name__ = 'HTTPError'
+    _CrTimeout.__name__ = 'Timeout'
+
+    class _CrResponse(object):
+        def __init__(self, url, status, reason, headers, text):
+            self.url = url
+            self.status_code = status
+            self.reason = reason
+            self.headers = headers
+            self.text = text
+            self.encoding = 'utf-8'
+        @property
+        def content(self):
+            return self.text.encode('utf-8', 'replace')
+        @property
+        def ok(self):
+            return self.status_code < 400
+        def json(self, **kw):
+            return _cr_json.loads(self.text)
+        def raise_for_status(self):
+            if 400 <= self.status_code < 600:
+                raise _CrHTTPError(str(self.status_code) + ' ' + str(self.reason) + ' for url: ' + self.url)
+        def __repr__(self):
+            return '<Response [' + str(self.status_code) + ']>'
+
+    def _cr_requests_request(method, url, params=None, data=None, json=None, headers=None, timeout=None, **kw):
+        hdrs = dict(headers or {})
+        if params:
+            qs = _cr_uparse.urlencode(params, doseq=True)
+            url = url + ('&' if '?' in url else '?') + qs
+        body = None
+        if json is not None:
+            body = _cr_json.dumps(json)
+            if not _cr_has_ct(hdrs):
+                hdrs['Content-Type'] = 'application/json'
+        elif data is not None:
+            if isinstance(data, dict):
+                body = _cr_uparse.urlencode(data, doseq=True)
+                if not _cr_has_ct(hdrs):
+                    hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+            elif isinstance(data, bytes):
+                body = data.decode('utf-8', 'replace')
+            else:
+                body = str(data)
+        r = _cr_fetch(method.upper(), url, hdrs, body)
+        if r.get('status', 0) == 0:
+            detail = r.get('error') or 'network error'
+            raise _CrConnectionError('Failed to fetch ' + url + ' (' + detail + '). ' + _CR_CORS_HINT)
+        return _CrResponse(url, r['status'], r.get('statusText', ''), _cr_parse_headers(r.get('headers')), r.get('body', ''))
+
+    def _cr_mreq(method):
+        def _f(url, **kw):
+            return _cr_requests_request(method, url, **kw)
+        return _f
+
+    class _CrSession(object):
+        def __init__(self):
+            self.headers = {}
+            self.cookies = {}
+        def request(self, method, url, **kw):
+            h = dict(self.headers)
+            h.update(kw.pop('headers', None) or {})
+            return _cr_requests_request(method, url, headers=h, **kw)
+        def get(self, url, **kw):
+            return self.request('GET', url, **kw)
+        def post(self, url, **kw):
+            return self.request('POST', url, **kw)
+        def put(self, url, **kw):
+            return self.request('PUT', url, **kw)
+        def delete(self, url, **kw):
+            return self.request('DELETE', url, **kw)
+        def head(self, url, **kw):
+            return self.request('HEAD', url, **kw)
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    _cr_req_mod = _cr_types.ModuleType('requests')
+    _cr_req_mod.request = _cr_requests_request
+    _cr_req_mod.get = _cr_mreq('GET')
+    _cr_req_mod.post = _cr_mreq('POST')
+    _cr_req_mod.put = _cr_mreq('PUT')
+    _cr_req_mod.delete = _cr_mreq('DELETE')
+    _cr_req_mod.head = _cr_mreq('HEAD')
+    _cr_req_mod.options = _cr_mreq('OPTIONS')
+    _cr_req_mod.patch = _cr_mreq('PATCH')
+    _cr_req_mod.Session = _CrSession
+    _cr_req_exc = _cr_types.ModuleType('requests.exceptions')
+    _cr_req_exc.RequestException = _CrRequestException
+    _cr_req_exc.ConnectionError = _CrConnectionError
+    _cr_req_exc.HTTPError = _CrHTTPError
+    _cr_req_exc.Timeout = _CrTimeout
+    _cr_req_exc.ConnectTimeout = _CrTimeout
+    _cr_req_exc.ReadTimeout = _CrTimeout
+    _cr_req_mod.exceptions = _cr_req_exc
+    _cr_sys.modules['requests'] = _cr_req_mod
+    _cr_sys.modules['requests.exceptions'] = _cr_req_exc
+
+# ---------------- urllib.request (working urlopen) ----------------
+import io as _cr_io
+import email.message as _cr_emsg
+import urllib.request as _cr_ureq
+import urllib.error as _cr_uerr
+
+class _CrUrlResponse(_cr_io.BytesIO):
+    def __init__(self, url, status, reason, headers, body_bytes):
+        _cr_io.BytesIO.__init__(self, body_bytes)
+        self.url = url
+        self.status = status
+        self.code = status
+        self.reason = reason
+        self._headers_raw = headers
+        msg = _cr_emsg.Message()
+        for k, v in headers.items():
+            msg[k] = v
+        self.headers = msg
+        self.msg = msg
+    def getcode(self):
+        return self.status
+    def geturl(self):
+        return self.url
+    def info(self):
+        return self.headers
+    def getheaders(self):
+        return list(self._headers_raw.items())
+    def getheader(self, name, default=None):
+        for k, v in self._headers_raw.items():
+            if k.lower() == str(name).lower():
+                return v
+        return default
+
+def _cr_urlopen(url, data=None, timeout=None, **kw):
+    full_url = url
+    method = None
+    hdrs = {}
+    body = data
+    if hasattr(url, 'full_url'):
+        req = url
+        full_url = req.full_url
+        method = req.get_method()
+        hdrs = dict(req.header_items())
+        if body is None:
+            body = req.data
+    if method is None:
+        method = 'POST' if body is not None else 'GET'
+    body_text = None
+    if isinstance(body, bytes):
+        body_text = body.decode('utf-8', 'replace')
+    elif body is not None:
+        body_text = str(body)
+    if body_text is not None and not _cr_has_ct(hdrs):
+        hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+    r = _cr_fetch(method, full_url, hdrs, body_text)
+    if r.get('status', 0) == 0:
+        detail = r.get('error') or 'network error'
+        raise _cr_uerr.URLError('Failed to fetch ' + full_url + ' (' + detail + '). ' + _CR_CORS_HINT)
+    headers = _cr_parse_headers(r.get('headers'))
+    resp = _CrUrlResponse(full_url, r['status'], r.get('statusText', ''), headers, (r.get('body') or '').encode('utf-8', 'replace'))
+    if r['status'] >= 400:
+        raise _cr_uerr.HTTPError(full_url, r['status'], r.get('statusText') or 'HTTP error', resp.headers, resp)
+    return resp
+
+_cr_ureq.urlopen = _cr_urlopen
+`;
 
 var pythonWorkerSrc = [
   "importScripts('" + PYODIDE_CDN + "');",
+  "var PY_PRELUDE = " + JSON.stringify(PY_PRELUDE) + ";",
   "var pyodideReady = null;",
+  "var preludeDone = false;",
+  "var PACKAGE_ALIASES = { PIL: 'Pillow', cv2: 'opencv-python', yaml: 'pyyaml', sklearn: 'scikit-learn' };",
+  "self.__crXhrFetch = function(method, url, headersJson, bodyText) {",
+  "  var result = { status: 0, statusText: '', headers: '', body: '', error: '' };",
+  "  try {",
+  "    var xhr = new XMLHttpRequest();",
+  "    xhr.open(method, url, false);",
+  "    var hdrs = {};",
+  "    try { hdrs = JSON.parse(headersJson || '{}'); } catch (e) {}",
+  "    for (var k in hdrs) { try { xhr.setRequestHeader(k, String(hdrs[k])); } catch (e) {} }",
+  "    xhr.send(bodyText === undefined || bodyText === null ? null : bodyText);",
+  "    result.status = xhr.status || 0;",
+  "    result.statusText = xhr.statusText || '';",
+  "    try { result.headers = xhr.getAllResponseHeaders() || ''; } catch (e) {}",
+  "    try { result.body = xhr.responseText || ''; } catch (e) {}",
+  "  } catch (e) {",
+  "    result.error = String((e && e.message) || e);",
+  "  }",
+  "  return JSON.stringify(result);",
+  "};",
   "function ensurePyodide() {",
-  "  if (!pyodideReady) pyodideReady = loadPyodide();",
+  "  if (!pyodideReady) {",
+  "    pyodideReady = loadPyodide().then(function(py) {",
+  "      return py.loadPackage('sqlite3').then(function() { return py; }, function() { return py; });",
+  "    });",
+  "  }",
   "  return pyodideReady;",
   "}",
-  "onmessage = function(e) {",
-  "  var code = e.data.code;",
-  "  ensurePyodide().then(function(py) {",
+  "function missingModule(msg) {",
+  "  var m = /No module named '([^']+)'/.exec(msg || '');",
+  "  return m ? m[1] : null;",
+  "}",
+  "function runAttempt(py, code) {",
+  "  return new Promise(function(resolve) {",
   "    var stdout = '', stderr = '';",
   "    py.setStdout({ batched: function(s) { stdout += s + '\\n'; } });",
   "    py.setStderr({ batched: function(s) { stderr += s + '\\n'; } });",
   "    var p;",
   "    try { p = py.runPythonAsync(code); }",
-  "    catch (err) { postMessage({ ok: false, output: '', error: String((err && err.message) || err) }); return; }",
-  "    p.then(function() { postMessage({ ok: true, output: stdout, error: stderr }); },",
-  "           function(err) { postMessage({ ok: false, output: stdout, error: String((err && err.message) || err) }); });",
+  "    catch (err) { resolve({ ok: false, output: stdout, error: String((err && err.message) || err) }); return; }",
+  "    p.then(function() { resolve({ ok: true, output: stdout, error: stderr }); },",
+  "           function(err) { resolve({ ok: false, output: stdout, error: String((err && err.message) || err) }); });",
+  "  });",
+  "}",
+  "async function runWithAutoLoad(py, code) {",
+  "  var notes = [];",
+  "  if (!preludeDone) {",
+  "    preludeDone = true;",
+  "    try { py.runPython(PY_PRELUDE); }",
+  "    catch (err) { notes.push('Note: the browser networking setup failed to load (' + String((err && err.message) || err).slice(0, 160) + '), so requests/urllib may be unavailable in this session.'); }",
+  "  }",
+  "  var tried = {};",
+  "  var res = null;",
+  "  for (var attempt = 0; attempt < 4; attempt++) {",
+  "    res = await runAttempt(py, code);",
+  "    if (res.ok) break;",
+  "    var mod = missingModule(res.error);",
+  "    if (!mod) break;",
+  "    var top = mod.split('.')[0];",
+  "    var pkg = PACKAGE_ALIASES[top] || top;",
+  "    if (tried[pkg]) break;",
+  "    tried[pkg] = true;",
+  "    try {",
+  "      await py.loadPackage(pkg);",
+  "      notes.push('Auto-loaded the ' + pkg + ' package (browser Python ships it separately) and re-ran your code.');",
+  "    } catch (err) { break; }",
+  "  }",
+  "  res.note = notes.join(' ');",
+  "  return res;",
+  "}",
+  "onmessage = function(e) {",
+  "  var code = e.data.code;",
+  "  ensurePyodide().then(function(py) {",
+  "    return runWithAutoLoad(py, code);",
+  "  }).then(function(res) {",
+  "    postMessage(res);",
   "  }, function(err) {",
   "    postMessage({ ok: false, output: '', error: 'Python runtime failed to load: ' + String((err && err.message) || err) });",
   "  });",
@@ -204,6 +498,9 @@ async function execute(isRetry) {
       out.innerHTML = (res.output ? '<span class="ok">' + esc(res.output) + '</span>\n' : '') +
         '<span class="err">' + esc(lastStderr) + '</span>';
     }
+    if (res.note && !failed && !isRetry) {
+      notesEl.innerHTML = esc(res.note);
+    }
     // Automatic fix: on failure, try rule-based repair first, then free AI, then re-run once.
     if (failed && !isRetry) {
       var fixed = (lang === 'python') ? autofixPython(codeEl.value, lastStderr) : autofixJs(codeEl.value, lastStderr);
@@ -247,30 +544,35 @@ function cleanAiCode(text) {
 
 async function aiFix(code, stderr, lang) {
   var envNote = lang === 'python'
-    ? '\n\nENVIRONMENT: this code runs in a browser via Pyodide. There is NO pip and NO micropip. Only the Python standard library is available (json, re, math, random, datetime, urllib, etc). If the code imports a third-party package like requests, rewrite it using only the standard library (e.g. urllib.request instead of requests). Never suggest pip install or micropip.'
+    ? '\n\nENVIRONMENT: this code runs in a browser via Pyodide (Python inside a web page). Facts: (1) The standard library works, and packages Pyodide ships separately (like sqlite3) are loaded automatically by the runner, so keep those imports as they are. (2) requests and urllib.request DO work for http/https through the browser network. A request can still fail if the target site refuses web-page requests (CORS) - that is a site restriction, not a code bug, and cannot be fixed by editing the code. (3) There is NO pip and NO micropip for arbitrary third-party packages; if the code imports a package outside the standard library that Pyodide does not ship, rewrite that part with the standard library only. (4) input() does not work; hardcode values instead. (5) There is no real file system; keep data in memory or io.StringIO. Never suggest pip install or micropip.'
     : '\n\nENVIRONMENT: this code runs in a browser sandbox. No Node.js APIs, no require(), no file system access. Use only standard browser JavaScript.';
   var prompt = 'Fix this ' + lang + ' code. It produced this error:\n' +
     stderr.slice(0, 2000) + '\n\nCode:\n' + code.slice(0, 4000) + envNote +
     '\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.';
   var errors = [];
-  // Method 1: POST, OpenAI-compatible.
-  try {
-    var r = await withTimeout(fetch('https://text.pollinations.ai/openai', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'openai',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 2000
-      })
-    }), 60000, 'AI fix');
-    if (!r.ok) throw new Error('AI service returned HTTP ' + r.status);
-    var data = await r.json();
-    var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (!text || !text.trim()) throw new Error('AI returned an empty response');
-    return cleanAiCode(text);
-  } catch (e) {
-    errors.push('POST: ' + (e.message || e));
+  // Method 1: POST, OpenAI-compatible. Tried twice: the free service
+  // occasionally drops a connection, which the browser reports as a bare
+  // "Failed to fetch" even though nothing is wrong on this side.
+  for (var postTry = 0; postTry < 2; postTry++) {
+    try {
+      var r = await withTimeout(fetch('https://text.pollinations.ai/openai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'openai',
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 2000
+        })
+      }), 60000, 'AI fix');
+      if (!r.ok) throw new Error('AI service returned HTTP ' + r.status);
+      var data = await r.json();
+      var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      if (!text || !text.trim()) throw new Error('AI returned an empty response');
+      return cleanAiCode(text);
+    } catch (e) {
+      errors.push((postTry ? 'POST retry: ' : 'POST: ') + (e.message || e));
+      if (!postTry) await new Promise(function(res) { setTimeout(res, 1500); });
+    }
   }
   // Method 2: GET fallback.
   try {
@@ -282,7 +584,7 @@ async function aiFix(code, stderr, lang) {
   } catch (e2) {
     errors.push('GET: ' + (e2.message || e2));
   }
-  throw new Error(errors.join(' | ') + ' - check your connection and try again');
+  throw new Error(errors.join(' | ') + ' - the free AI service did not answer. It may be busy, or this browser or network blocked it. Your code and its original error are still shown above.');
 }
 
 async function autofix() {
@@ -317,9 +619,9 @@ function autofixPython(code, stderr) {
   var m = stderr.match(/ModuleNotFoundError: No module named '([^']+)'/);
   if (m) {
     if (m[1] === 'requests') {
-      notes.push("Browser Python can't pip install 'requests'. The AI fixer can rewrite this to use urllib (built-in).");
+      notes.push("'requests' works in this runner through a built-in browser bridge, so this error should not normally appear. If it does, run the code again.");
     } else {
-      notes.push("Missing module '" + m[1] + "'. Browser Python can't pip install; stick to built-in modules (json, re, math, random, datetime, collections, itertools, hashlib, base64).");
+      notes.push("Missing module '" + m[1] + "'. Packages that browser Python ships separately (like sqlite3) are loaded automatically by the runner. This one could not be loaded, and browser Python can't pip install; stick to built-in modules (json, re, math, random, datetime, collections, itertools, hashlib, base64) or rewrite without it.");
     }
   }
   if (/EOFError|StdinNotImplementedError/i.test(stderr) || (/input\(\)/.test(code) && /EOF/.test(stderr))) {
@@ -375,6 +677,18 @@ function autofixJs(code, stderr) {
   if (m) notes.push('Type error: ' + m[1] + '. Check that values are the type the code expects.');
   if (!notes.length) notes.push('No automatic fix found. The error message and line number point at the problem.');
   return { code: code, notes: notes, changed: false };
+}
+
+function downloadCode() {
+  var lang = document.getElementById('lang').value;
+  var code = document.getElementById('code').value;
+  var blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (lang === 'python') ? 'code.py' : 'code.js';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 400);
 }
 
 function clearAll() {
