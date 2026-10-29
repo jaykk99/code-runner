@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Code Runner</title>
-<!-- Code Runner build 2026-10-29.2: python http bridge (requests/urllib), package auto-load incl. sqlite3, AI-fix POST retry, download button -->
+<!-- Code Runner build 2026-10-29.3: AI fix waits out the free-tier 30s-per-IP limit (the real cause of HTTP 402) and retries across models, GET only for short prompts (long ones 404), built-in error explainer when the AI service cannot answer; plus python http bridge (requests/urllib), package auto-load incl. sqlite3, download button -->
 <style>
   body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }
   main { max-width:900px; margin:0 auto; }
@@ -512,7 +512,7 @@ async function execute(isRetry) {
       }
       notesEl.innerHTML = '<b>AI is fixing the error...</b>';
       try {
-        var aiCode = await aiFix(codeEl.value, lastStderr, lang);
+        var aiCode = await aiFix(codeEl.value, lastStderr, lang, function(msg) { notesEl.innerHTML = '<b>' + esc(msg) + '</b>'; });
         if (aiCode && aiCode.trim() && aiCode.trim() !== codeEl.value.trim()) {
           codeEl.value = aiCode;
           notesEl.innerHTML = '<b>AI fixed it, re-running...</b>';
@@ -523,7 +523,7 @@ async function execute(isRetry) {
       } catch (e) {
         // Surface the REAL reason instead of a generic message.
         notesEl.innerHTML = '<b>AI fix failed:</b> ' + esc(e.message || String(e)) + '<br>' +
-          fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
+          fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>') + explainHtml(codeEl.value, lastStderr, lang);
       }
     }
   } finally {
@@ -533,16 +533,27 @@ async function execute(isRetry) {
 
 // ---------------------------------------------------------------------------
 // Free AI code fixer (Pollinations, no key needed).
-// Method 1 (primary): POST to the OpenAI-compatible endpoint with a JSON body.
-//   This avoids stuffing the whole prompt into a URL, which was flaky.
-// Method 2 (fallback): the original GET endpoint.
-// Both are tried before giving up, and the real error is surfaced.
+// What is actually true of the free service (measured live, Oct 29):
+// - POST https://text.pollinations.ai/openai works, CORS open, real answers.
+// - The anonymous tier allows about 1 reply every 30 seconds PER IP. Calls
+//   inside that window get HTTP 402 with a FREE_LIMIT body ("Retry after
+//   Ns"). It is a rate limit, not a hard paywall: wait out the window and
+//   the next call works.
+// - The old GET fallback (whole prompt in the URL) returns HTTP 404 for
+//   any realistic prompt because the URL gets too long. It is only tried
+//   when the prompt is short enough to have a chance.
+// Chain: POST (openai) -> on 402, wait out the limit -> POST (openai-fast)
+// -> on 402 again, wait once more -> POST (openai) -> GET (short prompts
+// only). Every attempt's real result is reported. If the service still
+// does not answer, the caller shows built-in guidance (explainError).
 // ---------------------------------------------------------------------------
 function cleanAiCode(text) {
   return text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
 }
 
-async function aiFix(code, stderr, lang) {
+function sleepMs(ms) { return new Promise(function(res) { setTimeout(res, ms); }); }
+
+async function aiFix(code, stderr, lang, onStatus) {
   var envNote = lang === 'python'
     ? '\n\nENVIRONMENT: this code runs in a browser via Pyodide (Python inside a web page). Facts: (1) The standard library works, and packages Pyodide ships separately (like sqlite3) are loaded automatically by the runner, so keep those imports as they are. (2) requests and urllib.request DO work for http/https through the browser network. A request can still fail if the target site refuses web-page requests (CORS) - that is a site restriction, not a code bug, and cannot be fixed by editing the code. (3) There is NO pip and NO micropip for arbitrary third-party packages; if the code imports a package outside the standard library that Pyodide does not ship, rewrite that part with the standard library only. (4) input() does not work; hardcode values instead. (5) There is no real file system; keep data in memory or io.StringIO. Never suggest pip install or micropip.'
     : '\n\nENVIRONMENT: this code runs in a browser sandbox. No Node.js APIs, no require(), no file system access. Use only standard browser JavaScript.';
@@ -550,41 +561,169 @@ async function aiFix(code, stderr, lang) {
     stderr.slice(0, 2000) + '\n\nCode:\n' + code.slice(0, 4000) + envNote +
     '\n\nReturn ONLY the complete fixed code. No explanations, no markdown fences, no extra text.';
   var errors = [];
-  // Method 1: POST, OpenAI-compatible. Tried twice: the free service
-  // occasionally drops a connection, which the browser reports as a bare
-  // "Failed to fetch" even though nothing is wrong on this side.
-  for (var postTry = 0; postTry < 2; postTry++) {
+  function status(msg) { if (onStatus) { try { onStatus(msg); } catch (e) {} } }
+  async function postOnce(model, label) {
+    var r = await withTimeout(fetch('https://text.pollinations.ai/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 2000
+      })
+    }), 60000, label);
+    if (!r.ok) {
+      var body = '';
+      try { body = await r.text(); } catch (e) {}
+      var err = new Error('AI service returned HTTP ' + r.status);
+      err.status = r.status;
+      var rm = body.match(/retry after (\d+)\s*s/i);
+      if (rm) err.retryAfter = parseInt(rm[1], 10);
+      if (/FREE_LIMIT|free limit/i.test(body)) err.freeLimit = true;
+      throw err;
+    }
+    var data = await r.json();
+    var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!text || !text.trim()) throw new Error('AI returned an empty response');
+    return cleanAiCode(text);
+  }
+  async function waitOutLimit(err) {
+    var secs = err && err.retryAfter ? err.retryAfter + 2 : 32;
+    if (secs < 15) secs = 15;
+    if (secs > 45) secs = 45;
+    for (var s = secs; s > 0; s--) {
+      status('AI fix: the free AI service allows about 1 reply every 30 seconds per address, and this address just used one (that is the HTTP 402 you may have seen). Waiting ' + s + 's, then trying again...');
+      await sleepMs(1000);
+    }
+    status('AI fix: trying the AI again...');
+  }
+  // Attempt 1: POST, main model.
+  var lastErr = null;
+  try { return await postOnce('openai', 'AI fix'); }
+  catch (e) { errors.push('POST: ' + (e.message || e)); lastErr = e; }
+  // Attempt 2: second model. Wait out the free limit first if that was it.
+  if (lastErr && (lastErr.status === 402 || lastErr.freeLimit)) { await waitOutLimit(lastErr); }
+  else { await sleepMs(1500); }
+  try { return await postOnce('openai-fast', 'AI fix (second model)'); }
+  catch (e2) { errors.push('POST 2: ' + (e2.message || e2)); lastErr = e2; }
+  // Attempt 3: the limit bit again -> one more wait, one last POST.
+  if (lastErr && (lastErr.status === 402 || lastErr.freeLimit)) {
+    await waitOutLimit(lastErr);
+    try { return await postOnce('openai', 'AI fix (final try)'); }
+    catch (e3) { errors.push('POST 3: ' + (e3.message || e3)); }
+  }
+  // Attempt 4: GET endpoint, only when the URL is short enough to work.
+  var getUrl = 'https://text.pollinations.ai/' + encodeURIComponent(prompt);
+  if (getUrl.length <= 1800) {
     try {
-      var r = await withTimeout(fetch('https://text.pollinations.ai/openai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'openai',
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 2000
-        })
-      }), 60000, 'AI fix');
-      if (!r.ok) throw new Error('AI service returned HTTP ' + r.status);
-      var data = await r.json();
-      var text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-      if (!text || !text.trim()) throw new Error('AI returned an empty response');
-      return cleanAiCode(text);
-    } catch (e) {
-      errors.push((postTry ? 'POST retry: ' : 'POST: ') + (e.message || e));
-      if (!postTry) await new Promise(function(res) { setTimeout(res, 1500); });
+      var r2 = await withTimeout(fetch(getUrl, { method: 'GET' }), 60000, 'AI fix fallback');
+      if (!r2.ok) throw new Error('AI service returned HTTP ' + r2.status);
+      var text2 = (await r2.text()).trim();
+      if (!text2) throw new Error('AI returned an empty response');
+      return cleanAiCode(text2);
+    } catch (e4) { errors.push('GET: ' + (e4.message || e4)); }
+  } else {
+    errors.push('GET: skipped (prompt too long for the GET endpoint; it answers 404 for long prompts)');
+  }
+  throw new Error(errors.join(' | ') + ' - the free AI service did not answer. Built-in guidance for this error is shown below.');
+}
+
+// ---------------------------------------------------------------------------
+// Built-in error explainer. No network, no AI service: it pattern-matches
+// the error text and always returns plain-language cause + likely fix, so
+// the Fix button never dead-ends on a raw provider error again. Shown
+// whenever the AI service cannot be reached.
+// ---------------------------------------------------------------------------
+function explainError(code, stderr, lang) {
+  var lines = [];
+  function add(cause, fix) { lines.push('What happened: ' + cause); lines.push('Likely fix: ' + fix); }
+  var m;
+  if (lang === 'python') {
+    var reqNames = null;
+    var reqMatches = stderr.match(/the following arguments are required: ([^\n]+)/g);
+    if (reqMatches && reqMatches.length) {
+      // The traceback also quotes argparse's own source line containing a
+      // format string; the real one names actual flags (starts with -).
+      for (var ri = reqMatches.length - 1; ri >= 0; ri--) {
+        var cand = reqMatches[ri].replace(/^the following arguments are required: /, '').trim();
+        if (/^-/.test(cand) && !/%/.test(cand)) { reqNames = cand; break; }
+      }
+    }
+    if (reqNames || (/argparse/.test(stderr) && /SystemExit/.test(stderr))) {
+      add('the program uses argparse and quit because a required command-line argument was not given' + (reqNames ? ' (' + reqNames + ')' : '') + '. argparse prints its usage message and exits with code 2, which Python shows as SystemExit: 2. A web page cannot receive command-line flags, so parse_args() finds no arguments and stops the program before the real code runs.',
+        'give the argument a default instead of requiring it, for example add_argument("--input", default="some-value"), or drop argparse and set the values as plain variables at the top of the script. The rest of the code then runs here unchanged.');
+    } else if (/SystemExit/.test(stderr)) {
+      add('the program stopped on purpose: something called sys.exit() (or exit()), and Python reports that as SystemExit. It is an intentional stop, not a crash.',
+        'find the sys.exit() call or the condition that triggers it and check whether that condition is true by mistake. In this browser runner it is often argparse (see above) or a check for arguments or files that a web page cannot provide.');
+    }
+    m = stderr.match(/ModuleNotFoundError: No module named '([^']+)'/);
+    if (m) {
+      add("the code imports a module called '" + m[1] + "' that is not available here. Browser Python (Pyodide) can load the standard library and the separate packages it ships (like sqlite3, which this runner loads automatically), but it cannot pip install new ones.",
+        "check the spelling first. If '" + m[1] + "' is a third-party package, rewrite that part with the standard library (json, re, math, random, datetime, collections, itertools, hashlib, base64 cover most jobs). If it is your own file, paste its code into the same script above the import.");
+    }
+    m = stderr.match(/NameError: name '([^']+)' is not defined/);
+    if (m) {
+      add("the code uses a name, '" + m[1] + "', that was never defined before that line. Usual causes: a typo, a missing import, or the line that defines it runs later (or sits inside a branch that did not run).",
+        "check the spelling of '" + m[1] + "' everywhere. If it is a module, add the import at the top (import " + m[1] + "). If it is a variable or function, define it before the line that uses it.");
+    }
+    if (/IndentationError/.test(stderr)) {
+      add('Python reads blocks by indentation, and one line is indented differently from what Python expected (often a line after an if/for/def line that is not indented, an extra indent, or tabs mixed with spaces).',
+        'line up the block: lines inside if/for/while/def/with/try should share the same indent, 4 spaces per level, spaces only (no tab characters). The line number in the error is where to look first; the real problem is sometimes the line just above it.');
+    }
+    if (/SyntaxError/.test(stderr) && !/IndentationError/.test(stderr)) {
+      add('Python could not parse the code at all: the flagged line is not valid Python. Common causes are a missing colon at the end of an if/for/def line, an unclosed bracket or quote, or a stray character.',
+        'look at the flagged line and the one just above it. Check for a missing colon (:) after if/elif/else/for/while/def/class/try/except, and that every (, [, { and quote opened on the line is closed.');
+    }
+    m = stderr.match(/TypeError: ([^\n]+)/);
+    if (m) {
+      add('an operation got a value of the wrong type (' + m[1].trim() + '). Classic cases: adding a string to a number, calling something that is not a function, or passing the wrong number of arguments.',
+        'print the values (and type(x)) just before the failing line to see what you actually have. Convert explicitly where needed (int(), str(), list()), and check the failing function is being called with the arguments it expects.');
+    }
+    if (/EOFError|StdinNotImplementedError/.test(stderr) || /input\(\)/.test(code) && /EOF/.test(stderr)) {
+      add('the code called input(), which cannot work in a browser page: there is no keyboard console attached, so Python gives up with an EOF error.',
+        'replace input(...) with a hardcoded value, for example name = "Jay" instead of name = input("Name? ").');
+    }
+    m = stderr.match(/ValueError: ([^\n]+)/);
+    if (m) {
+      add('a function got a value of the right type but an unusable content (' + m[1].trim() + '), for example int("abc") or unpacking the wrong number of items.',
+        'print the value just before the failing line and check its actual content and shape, then convert or split it the way the function expects.');
+    }
+    if (/IndexError/.test(stderr)) {
+      add('the code asked for a position in a list or string that does not exist (index too big, or the list is empty).',
+        'print len(the_list) and the index being used just before the failing line; guard with if index < len(the_list) when the data can vary.');
+    }
+    m = stderr.match(/KeyError: ([^\n]+)/);
+    if (m) {
+      add('the code looked up a dictionary key that is not in the dictionary (' + m[1].trim() + ').',
+        'check the spelling of the key, print the dictionary (or its .keys()) before the lookup, or use dict.get(key, default) when the key may legitimately be missing.');
+    }
+    if (/ZeroDivisionError/.test(stderr)) {
+      add('the code divided by zero, which Python refuses.',
+        'check the divisor just before the failing line; if it can be zero, guard it (if divisor != 0) or give it a sensible default.');
+    }
+  } else {
+    m = stderr.match(/ReferenceError: (\w+) is not defined/) || stderr.match(/(\w+) is not defined/);
+    if (m) {
+      add("the code uses a name, '" + m[1] + "', that was never declared. Usual causes: a typo, or the let/const/var or function definition runs after the line that uses it.",
+        "check the spelling of '" + m[1] + "' everywhere, and declare it (let " + m[1] + " = ...) before the line that uses it.");
+    }
+    m = stderr.match(/TypeError: ([^\n]+)/);
+    if (m) {
+      add('an operation got a value of the wrong kind (' + m[1].trim() + '), for example reading a property of undefined/null, or calling something that is not a function.',
+        'console.log the value just before the failing line to see what it really is; check for undefined/null and that the thing being called is actually a function.');
+    }
+    if (/SyntaxError/.test(stderr)) {
+      add('the browser could not parse the JavaScript: something on the flagged line is not valid syntax, often an unclosed bracket, brace or quote, or a stray character.',
+        'count the opening and closing (), [] and {} around the flagged line and check quotes are closed; the real problem is often on the line just above.');
     }
   }
-  // Method 2: GET fallback.
-  try {
-    var r2 = await withTimeout(fetch('https://text.pollinations.ai/' + encodeURIComponent(prompt), { method: 'GET' }), 60000, 'AI fix fallback');
-    if (!r2.ok) throw new Error('AI service returned HTTP ' + r2.status);
-    var text2 = (await r2.text()).trim();
-    if (!text2) throw new Error('AI returned an empty response');
-    return cleanAiCode(text2);
-  } catch (e2) {
-    errors.push('GET: ' + (e2.message || e2));
-  }
-  throw new Error(errors.join(' | ') + ' - the free AI service did not answer. It may be busy, or this browser or network blocked it. Your code and its original error are still shown above.');
+  if (!lines.length) lines.push('What happened: the error type and the line number at the end of the traceback point at the problem. Read the last line of the error first; it names the error and usually the exact value or name involved.');
+  return lines;
+}
+
+function explainHtml(code, stderr, lang) {
+  return '<br><b>Built-in guidance</b> (always available, no AI service needed):<br>' +
+    explainError(code, stderr, lang).map(function(n) { return '&bull; ' + esc(n); }).join('<br>');
 }
 
 async function autofix() {
@@ -600,7 +739,7 @@ async function autofix() {
   }
   notes.innerHTML = '<b>AI is fixing the error...</b>';
   try {
-    var aiCode = await aiFix(codeEl.value, lastStderr, lang);
+    var aiCode = await aiFix(codeEl.value, lastStderr, lang, function(msg) { notes.innerHTML = '<b>' + esc(msg) + '</b>'; });
     if (aiCode && aiCode.trim() && aiCode.trim() !== codeEl.value.trim()) {
       codeEl.value = aiCode;
       notes.innerHTML = '<b>AI fixed it. Hit Run to test.</b>';
@@ -609,7 +748,7 @@ async function autofix() {
     }
   } catch (e) {
     notes.innerHTML = '<b>AI fix failed:</b> ' + esc(e.message || String(e)) + '<br>' +
-      fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>');
+      fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>') + explainHtml(codeEl.value, lastStderr, lang);
   }
 }
 
