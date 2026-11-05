@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Code Runner</title>
-<!-- Code Runner build 2026-10-29.3: AI fix waits out the free-tier 30s-per-IP limit (the real cause of HTTP 402) and retries across models, GET only for short prompts (long ones 404), built-in error explainer when the AI service cannot answer; plus python http bridge (requests/urllib), package auto-load incl. sqlite3, download button -->
+<!-- Code Runner build 2026-11-04.1 (Monico Labs shop readiness): two-phase run timeouts (generous runtime-load window, tight run window once code actually starts, so hung code dies in 20s Python / 10s JS instead of looking stalled for 60s), AI fix reports which try it is on, Run/Auto-fix can no longer interleave, JS alert/prompt/confirm no longer crash beginner code, Monico access-code Pro unlock (longer runs, saved snippets, open file) checked against the Monico Labs hub. Earlier: AI fix waits out the free-tier 30s-per-IP limit (the real cause of HTTP 402) and retries across models, GET only for short prompts (long ones 404), built-in error explainer when the AI service cannot answer; plus python http bridge (requests/urllib), package auto-load incl. sqlite3, download button -->
 <style>
   body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }
   main { max-width:900px; margin:0 auto; }
@@ -12,6 +12,8 @@
   .sub { color:#64748b; font-size:14px; margin-bottom:16px; }
   .row { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
   select { background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:10px 14px; font-size:15px; }
+  input[type="text"] { background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:10px 14px; font-size:15px; min-width:280px; flex:1; max-width:420px; }
+  #gateMsg { font-size:14px; color:#a78bfa; }
   button { background:#22d3ee; color:#0b1220; border:0; border-radius:8px; padding:10px 24px;
     font-size:15px; font-weight:700; cursor:pointer; }
   button.ghost { background:#1e293b; color:#22d3ee; border:1px solid #334155; }
@@ -27,7 +29,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Python gets sqlite3, requests and urllib out of the box. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Python gets sqlite3, requests and urllib out of the box. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically. Bought Code Runner from Monico Labs? Unlock Pro (longer runs, saved snippets, open your own files) with your access code below.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -37,6 +39,18 @@
     <button id="fixBtn" class="ghost" onclick="autofix()">Auto-fix errors</button>
     <button class="ghost" onclick="downloadCode()">Download</button>
     <button class="ghost" onclick="clearAll()">Clear</button>
+  </div>
+  <div class="row">
+    <input id="codeInput" type="text" placeholder="Monico access code (ML-....-....-....-....)" autocomplete="off" spellcheck="false">
+    <button id="unlockBtn" class="ghost" onclick="unlock()">Unlock Pro</button>
+    <span id="gateMsg"></span>
+  </div>
+  <div class="row" id="proRow" style="display:none">
+    <select id="snipSel" onchange="loadSnippet()"><option value="">Saved snippets...</option></select>
+    <button class="ghost" onclick="saveSnippet()">Save snippet</button>
+    <button class="ghost" onclick="deleteSnippet()">Delete snippet</button>
+    <button class="ghost" onclick="document.getElementById('fileInput').click()">Open file...</button>
+    <input id="fileInput" type="file" accept=".py,.js,.txt" style="display:none" onchange="openFile(event)">
   </div>
   <textarea id="code" spellcheck="false" placeholder="print('hello world')"></textarea>
   <div id="notes"></div>
@@ -53,8 +67,9 @@ var lastStderr = '';
 // could not interrupt code already running on the main thread.
 // ---------------------------------------------------------------------------
 var PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
-var PYTHON_TIMEOUT_MS = 60000;
-var JS_TIMEOUT_MS = 10000;
+// Run limits live on the runners below (makeRunner opts): a generous window
+// while the runtime itself is still loading, then a tight window once the
+// worker signals the user code is actually running.
 
 // ---------------------------------------------------------------------------
 // Python prelude, installed inside Pyodide before user code runs.
@@ -363,6 +378,7 @@ var pythonWorkerSrc = [
   "onmessage = function(e) {",
   "  var code = e.data.code;",
   "  ensurePyodide().then(function(py) {",
+  "    postMessage({ __cr: 'started' });",
   "    return runWithAutoLoad(py, code);",
   "  }).then(function(res) {",
   "    postMessage(res);",
@@ -374,14 +390,18 @@ var pythonWorkerSrc = [
 
 var jsWorkerSrc = [
   "onmessage = function(e) {",
+  "  postMessage({ __cr: 'started' });",
   "  var logs = [];",
   "  function push(args) { logs.push(Array.prototype.map.call(args, String).join(' ')); }",
   "  var fakeConsole = { log: function(){ push(arguments); }, error: function(){ push(arguments); }, warn: function(){ push(arguments); } };",
+  "  var fakeAlert = function(x) { logs.push('[alert] ' + String(x)); };",
+  "  var fakePrompt = function(q) { logs.push('[prompt] ' + String(q || '') + ' (a web page sandbox cannot ask questions, so the code got an empty answer)'); return ''; };",
+  "  var fakeConfirm = function(q) { logs.push('[confirm] ' + String(q || '') + ' (answered OK automatically)'); return true; };",
   "  var fn;",
-  "  try { fn = new (Object.getPrototypeOf(async function(){}).constructor)('console', e.data.code); }",
+  "  try { fn = new (Object.getPrototypeOf(async function(){}).constructor)('console', 'alert', 'prompt', 'confirm', e.data.code); }",
   "  catch (err) { postMessage({ ok: false, output: '', error: String((err && err.stack) || err) }); return; }",
   "  var r;",
-  "  try { r = fn(fakeConsole); }",
+  "  try { r = fn(fakeConsole, fakeAlert, fakePrompt, fakeConfirm); }",
   "  catch (err) { postMessage({ ok: false, output: logs.join('\\n'), error: String((err && err.stack) || err) }); return; }",
   "  Promise.resolve(r).then(function() { postMessage({ ok: true, output: logs.join('\\n'), error: '' }); },",
   "    function(err) { postMessage({ ok: false, output: logs.join('\\n'), error: String((err && err.stack) || err) }); });",
@@ -390,7 +410,14 @@ var jsWorkerSrc = [
 
 // A reusable worker slot: the worker stays alive between runs for speed, and
 // is destroyed + recreated only when a timeout kills it.
-function makeRunner(workerSrc, timeoutMs, label) {
+// Two-phase timeout: the worker starts on a generous LOAD window (the Python
+// runtime itself can take a while to download on a slow connection), and the
+// moment it posts {__cr:'started'} — user code is actually running — the
+// clock restarts on the tight RUN window. Before this split, one 60s clock
+// covered both, so a hung Python script sat on "Running..." for a full
+// minute and the page felt stalled (worst right after an auto-fix re-run,
+// when the user is staring at it waiting to see if the fix worked).
+function makeRunner(workerSrc, opts) {
   var worker = null;
   function getWorker() {
     if (!worker) {
@@ -402,23 +429,35 @@ function makeRunner(workerSrc, timeoutMs, label) {
     return new Promise(function(resolve, reject) {
       var w;
       try { w = getWorker(); } catch (e) {
-        reject(new Error(label + ' could not start: ' + (e.message || e)));
+        reject(new Error(opts.label + ' could not start: ' + (e.message || e)));
         return;
       }
       var done = false;
-      var timer = setTimeout(function() {
-        if (done) return;
-        done = true;
-        try { w.terminate(); } catch (e) {}
-        worker = null; // timed-out worker is dead; next run gets a fresh one
-        reject(new Error(label + ' timed out after ' + (timeoutMs / 1000) + 's and was stopped'));
-      }, timeoutMs);
+      var timer = null;
+      function arm(ms, phase) {
+        clearTimeout(timer);
+        timer = setTimeout(function() {
+          if (done) return;
+          done = true;
+          try { w.terminate(); } catch (e) {}
+          worker = null; // timed-out worker is dead; next run gets a fresh one
+          if (phase === 'load') {
+            reject(new Error(opts.label + ' could not start within ' + (ms / 1000) + 's (the runtime download stalled) and was stopped'));
+          } else {
+            reject(new Error(opts.label + ' timed out after ' + (ms / 1000) + 's and was stopped'));
+          }
+        }, ms);
+      }
       function cleanup() {
         clearTimeout(timer);
         w.removeEventListener('message', onMsg);
         w.removeEventListener('error', onErr);
       }
       function onMsg(e) {
+        if (e.data && e.data.__cr === 'started') {
+          if (!done) arm(opts.runMs(), 'run');
+          return;
+        }
         if (done) return;
         done = true;
         cleanup();
@@ -428,23 +467,31 @@ function makeRunner(workerSrc, timeoutMs, label) {
         if (done) return;
         done = true;
         cleanup();
-        reject(new Error(label + ' crashed: ' + ((e && e.message) || 'worker error')));
+        worker = null; // a crashed worker never answers again; next run gets a fresh one
+        reject(new Error(opts.label + ' crashed: ' + ((e && e.message) || 'worker error')));
       }
       w.addEventListener('message', onMsg);
       w.addEventListener('error', onErr);
+      arm(opts.loadMs, 'load');
       try { w.postMessage({ code: code }); }
       catch (e) {
         if (done) return;
         done = true;
         cleanup();
-        reject(new Error(label + ' could not receive code: ' + (e.message || e)));
+        reject(new Error(opts.label + ' could not receive code: ' + (e.message || e)));
       }
     });
   };
 }
 
-var runPython = makeRunner(pythonWorkerSrc, PYTHON_TIMEOUT_MS, 'Python run');
-var runJs = makeRunner(jsWorkerSrc, JS_TIMEOUT_MS, 'JavaScript run');
+var runPython = makeRunner(pythonWorkerSrc, {
+  label: 'Python run', loadMs: 120000,
+  runMs: function() { return proUnlocked ? 120000 : 20000; }
+});
+var runJs = makeRunner(jsWorkerSrc, {
+  label: 'JavaScript run', loadMs: 15000,
+  runMs: function() { return proUnlocked ? 30000 : 10000; }
+});
 var pythonRuntimeReady = false;
 
 // Runs a promise with a timeout (used for network calls, where aborting is safe).
@@ -461,13 +508,25 @@ function withTimeout(promise, ms, label) {
 
 function run() { execute(false); }
 
+// One flow at a time: a run (including its auto-fix + re-run chain) or a
+// manual Auto-fix. Without this, clicking Auto-fix mid-run (or Run mid-fix)
+// interleaved the two, both rewrote the editor and the output, and the page
+// could end up showing a fix chain for code that was no longer on screen.
+var crBusy = false;
+
 async function execute(isRetry) {
+  if (!isRetry) {
+    if (crBusy) return;
+    crBusy = true;
+  }
   var out = document.getElementById('out');
   var btn = document.getElementById('runBtn');
+  var fixBtn = document.getElementById('fixBtn');
   var notesEl = document.getElementById('notes');
   var lang = document.getElementById('lang').value;
   var codeEl = document.getElementById('code');
   btn.disabled = true;
+  fixBtn.disabled = true;
   try {
     if (!isRetry) {
       out.innerHTML = (lang === 'python' && !pythonRuntimeReady)
@@ -528,6 +587,8 @@ async function execute(isRetry) {
     }
   } finally {
     btn.disabled = false; // always re-enable, even if something throws
+    fixBtn.disabled = false;
+    if (!isRetry) crBusy = false;
   }
 }
 
@@ -571,7 +632,7 @@ async function aiFix(code, stderr, lang, onStatus) {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 2000
       })
-    }), 60000, label);
+    }), 40000, label);
     if (!r.ok) {
       var body = '';
       try { body = await r.text(); } catch (e) {}
@@ -599,24 +660,28 @@ async function aiFix(code, stderr, lang, onStatus) {
   }
   // Attempt 1: POST, main model.
   var lastErr = null;
+  status('AI fix: asking the AI (try 1 of up to 4)...');
   try { return await postOnce('openai', 'AI fix'); }
   catch (e) { errors.push('POST: ' + (e.message || e)); lastErr = e; }
   // Attempt 2: second model. Wait out the free limit first if that was it.
   if (lastErr && (lastErr.status === 402 || lastErr.freeLimit)) { await waitOutLimit(lastErr); }
   else { await sleepMs(1500); }
+  status('AI fix: asking the second AI model (try 2)...');
   try { return await postOnce('openai-fast', 'AI fix (second model)'); }
   catch (e2) { errors.push('POST 2: ' + (e2.message || e2)); lastErr = e2; }
   // Attempt 3: the limit bit again -> one more wait, one last POST.
   if (lastErr && (lastErr.status === 402 || lastErr.freeLimit)) {
     await waitOutLimit(lastErr);
+    status('AI fix: asking the AI again (try 3)...');
     try { return await postOnce('openai', 'AI fix (final try)'); }
     catch (e3) { errors.push('POST 3: ' + (e3.message || e3)); }
   }
   // Attempt 4: GET endpoint, only when the URL is short enough to work.
   var getUrl = 'https://text.pollinations.ai/' + encodeURIComponent(prompt);
   if (getUrl.length <= 1800) {
+    status('AI fix: one last try (try 4)...');
     try {
-      var r2 = await withTimeout(fetch(getUrl, { method: 'GET' }), 60000, 'AI fix fallback');
+      var r2 = await withTimeout(fetch(getUrl, { method: 'GET' }), 40000, 'AI fix fallback');
       if (!r2.ok) throw new Error('AI service returned HTTP ' + r2.status);
       var text2 = (await r2.text()).trim();
       if (!text2) throw new Error('AI returned an empty response');
@@ -727,6 +792,13 @@ function explainHtml(code, stderr, lang) {
 }
 
 async function autofix() {
+  if (crBusy) return;
+  crBusy = true;
+  var runBtn = document.getElementById('runBtn');
+  var fixBtn = document.getElementById('fixBtn');
+  runBtn.disabled = true;
+  fixBtn.disabled = true;
+  try {
   var notes = document.getElementById('notes');
   var lang = document.getElementById('lang').value;
   var codeEl = document.getElementById('code');
@@ -749,6 +821,11 @@ async function autofix() {
   } catch (e) {
     notes.innerHTML = '<b>AI fix failed:</b> ' + esc(e.message || String(e)) + '<br>' +
       fixed.notes.map(function(n){ return '&bull; ' + esc(n); }).join('<br>') + explainHtml(codeEl.value, lastStderr, lang);
+  }
+  } finally {
+    crBusy = false;
+    runBtn.disabled = false;
+    fixBtn.disabled = false;
   }
 }
 
@@ -837,6 +914,144 @@ function clearAll() {
   lastStderr = '';
 }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ---------------------------------------------------------------------------
+// Monico Labs access code -> Code Runner Pro.
+// Same deal as the other shop products: the buyer gets an ML- code from the
+// Monico Labs checkout, and the code is checked against the shop hub
+// (POST /api/auth/code, the hub's own sign-in endpoint). The hub answers
+// with the code's grants; Pro unlocks only when a grant names product
+// "code-runner". Nothing is unlocked on a format guess or when the hub
+// cannot be reached — the message says which happened.
+// Pro unlocks: Python runs up to 120s (free 20s), JS up to 30s (free 10s),
+// saved snippets (this browser), and opening .py/.js files from disk.
+// ---------------------------------------------------------------------------
+var HUB_API = 'https://monico-labs-hub.onrender.com';
+var proUnlocked = false;
+var proTier = '';
+
+/* Same normalisation the hub applies (hub-worker/src/crypto.js):
+ * case, spaces, dashes, and the Crockford look-alikes (O->0, I/L->1). */
+function normalizeAccessCode(code) {
+  var s = String(code || '').toUpperCase().replace(/[\s-]/g, '');
+  if (s.indexOf('ML') === 0) s = s.slice(2);
+  s = s.replace(/O/g, '0').replace(/[IL]/g, '1');
+  if (!/^[0-9A-HJKMNP-TV-Z]{16}$/.test(s)) return null;
+  return 'ML-' + s.match(/.{4}/g).join('-');
+}
+
+function applyPro() {
+  proUnlocked = true;
+  document.getElementById('proRow').style.display = 'flex';
+  document.getElementById('gateMsg').innerHTML = '<b>Pro unlocked' + (proTier ? ' (' + esc(proTier) + ')' : '') + '.</b> Longer runs, saved snippets and file open are on.';
+  refreshSnippets();
+}
+
+async function checkCodeWithHub(code, quiet) {
+  var msg = document.getElementById('gateMsg');
+  if (!quiet) msg.textContent = 'Checking your code with the Monico Labs shop...';
+  var r = await withTimeout(fetch(HUB_API + '/api/auth/code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: code })
+  }), 30000, 'Code check');
+  if (r.status === 401) throw new Error('That access code is not valid.');
+  if (!r.ok) throw new Error('The shop answered HTTP ' + r.status + ' — try again in a bit.');
+  var data = await r.json();
+  var grants = (data && data.grants) || [];
+  var mine = null;
+  for (var i = 0; i < grants.length; i++) {
+    if (grants[i] && grants[i].product === 'code-runner') { mine = grants[i]; break; }
+  }
+  if (!mine) throw new Error('That code is real, but it does not include Code Runner.');
+  try {
+    localStorage.setItem('cr_hub_token', (data && data.token) || '');
+    localStorage.setItem('cr_code', code);
+  } catch (e) {}
+  proTier = mine.tier || '';
+  applyPro();
+}
+
+async function unlock() {
+  var msg = document.getElementById('gateMsg');
+  var code = normalizeAccessCode(document.getElementById('codeInput').value);
+  if (!code) {
+    msg.innerHTML = '<span class="err">That does not look like a Monico access code. Codes look like ML-XXXX-XXXX-XXXX-XXXX.</span>';
+    return;
+  }
+  try {
+    await checkCodeWithHub(code, false);
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message || String(e)) + '</span>';
+  }
+}
+
+// On load: if this browser unlocked before, quietly re-check the saved
+// code (hub tokens expire; the code itself is the durable credential).
+(function initGate() {
+  var saved = null;
+  try { saved = localStorage.getItem('cr_code'); } catch (e) {}
+  if (!saved) return;
+  document.getElementById('codeInput').value = saved;
+  checkCodeWithHub(saved, true).catch(function() {
+    document.getElementById('gateMsg').textContent = 'Saved code found — hit Unlock Pro to re-check it with the shop.';
+  });
+})();
+
+// ----- Pro: saved snippets (stored in this browser only) -----
+function snippetStore() {
+  try { return JSON.parse(localStorage.getItem('cr_snippets') || '{}'); } catch (e) { return {}; }
+}
+function refreshSnippets() {
+  var sel = document.getElementById('snipSel');
+  var store = snippetStore();
+  sel.innerHTML = '<option value="">Saved snippets...</option>';
+  Object.keys(store).sort().forEach(function(name) {
+    var o = document.createElement('option');
+    o.value = name;
+    o.textContent = name;
+    sel.appendChild(o);
+  });
+}
+function saveSnippet() {
+  var name = (prompt('Name this snippet:') || '').trim();
+  if (!name) return;
+  var store = snippetStore();
+  store[name] = { lang: document.getElementById('lang').value, code: document.getElementById('code').value };
+  try { localStorage.setItem('cr_snippets', JSON.stringify(store)); } catch (e) {}
+  refreshSnippets();
+  document.getElementById('snipSel').value = name;
+}
+function loadSnippet() {
+  var sel = document.getElementById('snipSel');
+  var s = snippetStore()[sel.value];
+  if (!s) return;
+  document.getElementById('lang').value = s.lang;
+  document.getElementById('code').value = s.code;
+}
+function deleteSnippet() {
+  var sel = document.getElementById('snipSel');
+  if (!sel.value) return;
+  var store = snippetStore();
+  delete store[sel.value];
+  try { localStorage.setItem('cr_snippets', JSON.stringify(store)); } catch (e) {}
+  refreshSnippets();
+}
+
+// ----- Pro: open a .py / .js file from disk into the editor -----
+function openFile(ev) {
+  var f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function() {
+    document.getElementById('code').value = String(rd.result || '');
+    if (/\.js$/i.test(f.name)) document.getElementById('lang').value = 'javascript';
+    else if (/\.py$/i.test(f.name)) document.getElementById('lang').value = 'python';
+  };
+  rd.readAsText(f);
+  ev.target.value = '';
+}
+
 document.getElementById('lang').addEventListener('change', function(e) {
   document.getElementById('code').placeholder = e.target.value === 'python' ? "print('hello world')" : "console.log('hello world');";
 });
