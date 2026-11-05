@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Code Runner</title>
-<!-- Code Runner build 2026-11-04.1 (Monico Labs shop readiness): two-phase run timeouts (generous runtime-load window, tight run window once code actually starts, so hung code dies in 20s Python / 10s JS instead of looking stalled for 60s), AI fix reports which try it is on, Run/Auto-fix can no longer interleave, JS alert/prompt/confirm no longer crash beginner code, Monico access-code Pro unlock (longer runs, saved snippets, open file) checked against the Monico Labs hub. Earlier: AI fix waits out the free-tier 30s-per-IP limit (the real cause of HTTP 402) and retries across models, GET only for short prompts (long ones 404), built-in error explainer when the AI service cannot answer; plus python http bridge (requests/urllib), package auto-load incl. sqlite3, download button -->
+<!-- Code Runner build 2026-11-04.1 (Monico Labs shop readiness): two-phase run timeouts (generous runtime-load window, tight run window once code actually starts, so hung code dies in 30s Python / 10s JS instead of looking stalled for 60s), AI fix reports which try it is on, Run/Auto-fix can no longer interleave, JS alert/prompt/confirm no longer crash beginner code, Monico access-code Pro unlock (longer runs, saved snippets, open file) checked against the Monico Labs hub. Earlier: AI fix waits out the free-tier 30s-per-IP limit (the real cause of HTTP 402) and retries across models, GET only for short prompts (long ones 404), built-in error explainer when the AI service cannot answer; plus python http bridge (requests/urllib), package auto-load incl. sqlite3, download button -->
 <style>
   body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }
   main { max-width:900px; margin:0 auto; }
@@ -486,7 +486,7 @@ function makeRunner(workerSrc, opts) {
 
 var runPython = makeRunner(pythonWorkerSrc, {
   label: 'Python run', loadMs: 120000,
-  runMs: function() { return proUnlocked ? 120000 : 20000; }
+  runMs: function() { return proUnlocked ? 120000 : 30000; }
 });
 var runJs = makeRunner(jsWorkerSrc, {
   label: 'JavaScript run', loadMs: 15000,
@@ -923,7 +923,7 @@ function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 // with the code's grants; Pro unlocks only when a grant names product
 // "code-runner". Nothing is unlocked on a format guess or when the hub
 // cannot be reached — the message says which happened.
-// Pro unlocks: Python runs up to 120s (free 20s), JS up to 30s (free 10s),
+// Pro unlocks: Python runs up to 120s (free 30s), JS up to 30s (free 10s),
 // saved snippets (this browser), and opening .py/.js files from disk.
 // ---------------------------------------------------------------------------
 var HUB_API = 'https://monico-labs-hub.onrender.com';

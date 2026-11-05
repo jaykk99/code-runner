@@ -10,7 +10,7 @@ Live: https://jaykk99.github.io/code-runner/
 
 - **Python** runs on Pyodide (CPython compiled to WebAssembly) inside a Web Worker. sqlite3 is preloaded, other shipped packages load automatically on first use, and `requests` / `urllib` work through a browser networking bridge.
 - **JavaScript** runs inside a Web Worker as an async function with a captured `console` (plus `alert` / `prompt` / `confirm` shims, which log instead of crashing).
-- **Hung code is killed automatically.** Once your code starts running it gets 20s (Python) or 10s (JavaScript); the worker is terminated on timeout and a fresh one is created for the next run, so the page never freezes. The runtime download itself gets a separate, longer window.
+- **Hung code is killed automatically.** Once your code starts running it gets 30s (Python) or 10s (JavaScript); the worker is terminated on timeout and a fresh one is created for the next run, so the page never freezes. The runtime download itself gets a separate, longer window.
 - **Auto-fix.** On an error, local rules patch common problems first (missing imports, indentation, tabs, missing colons). If they cannot fix it, the error goes to a free AI endpoint; the corrected code is pasted in and re-run automatically. If the AI service cannot answer, a built-in explainer shows the likely cause and fix.
 
 ## Code Runner Pro (Monico Labs)
