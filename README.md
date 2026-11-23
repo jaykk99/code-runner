@@ -15,8 +15,9 @@ Live: https://jaykk99.github.io/code-runner/
 
 ## Code Runner Pro (Monico Labs)
 
-The page above is the full free runner. Buying Code Runner from the
-Monico Labs shop gets you an access code (`ML-....`) that unlocks Pro
+The page above is the full free runner. [Buying Code Runner Pro ($19
+one-time)](https://monico-labs-insta.onrender.com/#/product/code-runner)
+from the Monico Labs shop gets you an access code (`ML-....`) that unlocks Pro
 on this page (checked against the shop hub, same as the other Monico
 Labs products):
 

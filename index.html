@@ -17,6 +17,9 @@
   button { background:#22d3ee; color:#0b1220; border:0; border-radius:8px; padding:10px 24px;
     font-size:15px; font-weight:700; cursor:pointer; }
   button.ghost { background:#1e293b; color:#22d3ee; border:1px solid #334155; }
+  a.ghostbtn { display:inline-block; background:#1e293b; color:#22d3ee; border:1px solid #334155;
+    border-radius:8px; padding:10px 24px; font-size:15px; font-weight:700; cursor:pointer;
+    text-decoration:none; }
   button:disabled { opacity:.5; }
   textarea { width:100%; height:320px; background:#0b1220; color:#e2e8f0; border:1px solid #334155;
     border-radius:8px; padding:14px; font-family:monospace; font-size:14px; box-sizing:border-box; resize:vertical; }
@@ -29,7 +32,7 @@
 <body>
 <main>
   <h1>Code Runner</h1>
-  <div class="sub">Run Python or JavaScript right in your browser. Python gets sqlite3, requests and urllib out of the box. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically. Bought Code Runner from Monico Labs? Unlock Pro (longer runs, saved snippets, open your own files) with your access code below.</div>
+  <div class="sub">Run Python or JavaScript right in your browser. Python gets sqlite3, requests and urllib out of the box. Errors get auto-fixed by AI and re-run on their own. Hung code is killed automatically. Pro ($19 one-time) unlocks longer runs, saved snippets, and opening your own files. Bought it already? Unlock Pro with your access code below.</div>
   <div class="row">
     <select id="lang">
       <option value="python">Python</option>
@@ -43,6 +46,7 @@
   <div class="row">
     <input id="codeInput" type="text" placeholder="Monico access code (ML-....-....-....-....)" autocomplete="off" spellcheck="false">
     <button id="unlockBtn" class="ghost" onclick="unlock()">Unlock Pro</button>
+    <a class="ghostbtn" href="https://monico-labs-insta.onrender.com/#/product/code-runner" target="_blank" rel="noopener">Get Pro — $19 one-time</a>
     <span id="gateMsg"></span>
   </div>
   <div class="row" id="proRow" style="display:none">
