@@ -35,4 +35,20 @@ python3 -m http.server
 # open http://localhost:8000
 ```
 
+## Tests
+
+```bash
+node test/verify.js
+# 25 checks, 0 failures
+```
+
+No dependencies. The suite loads the real page script into a VM with DOM
+stubs and drives the worker stubs: a Python run that succeeds with stderr
+output must not trigger the AI fix chain, a missing-import failure must
+still get the rule-based fix and re-run, the JS console shims
+(`info`/`debug`/`table`/`dir`/`trace`/`assert`/`count`/`time`/`timeEnd`/
+`group`/`clear`) must not throw, and a failed Python networking prelude
+must be retried on the next run instead of staying broken for the session.
+
+
 Internet is required at runtime for the Python runtime (Pyodide loads from the jsDelivr CDN), the AI fix fallback, and Pro code checks.

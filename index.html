@@ -352,8 +352,7 @@ var pythonWorkerSrc = [
   "async function runWithAutoLoad(py, code) {",
   "  var notes = [];",
   "  if (!preludeDone) {",
-  "    preludeDone = true;",
-  "    try { py.runPython(PY_PRELUDE); }",
+  "    try { py.runPython(PY_PRELUDE); preludeDone = true; }",
   "    catch (err) { notes.push('Note: the browser networking setup failed to load (' + String((err && err.message) || err).slice(0, 160) + '), so requests/urllib may be unavailable in this session.'); }",
   "  }",
   "  var tried = {};",
@@ -392,8 +391,31 @@ var jsWorkerSrc = [
   "onmessage = function(e) {",
   "  postMessage({ __cr: 'started' });",
   "  var logs = [];",
-  "  function push(args) { logs.push(Array.prototype.map.call(args, String).join(' ')); }",
-  "  var fakeConsole = { log: function(){ push(arguments); }, error: function(){ push(arguments); }, warn: function(){ push(arguments); } };",
+  "  function fmt(v) {",
+  "    if (typeof v === 'string') return v;",
+  "    try { var j = JSON.stringify(v); return (j === undefined) ? String(v) : j; }",
+  "    catch (e) { return String(v); }",
+  "  }",
+  "  function push(args) { logs.push(Array.prototype.map.call(args, fmt).join(' ')); }",
+  "  var _timers = {};",
+  "  var _counts = {};",
+  "  var fakeConsole = {",
+  "    log: function(){ push(arguments); },",
+  "    info: function(){ push(arguments); },",
+  "    debug: function(){ push(arguments); },",
+  "    error: function(){ push(arguments); },",
+  "    warn: function(){ push(arguments); },",
+  "    dir: function(){ push(arguments); },",
+  "    trace: function(){ push(arguments); },",
+  "    table: function(v){ logs.push(fmt(v)); },",
+  "    assert: function(c){ if (!c) { logs.push('[assert] ' + Array.prototype.map.call(arguments, fmt).slice(1).join(' ')); } },",
+  "    count: function(l){ var k = String(l || 'default'); _counts[k] = (_counts[k] || 0) + 1; logs.push(k + ': ' + _counts[k]); },",
+  "    time: function(l){ _timers[String(l || 'default')] = Date.now(); },",
+  "    timeEnd: function(l){ var k = String(l || 'default'); var t = _timers[k]; logs.push(k + ': ' + (t ? (Date.now() - t) + 'ms' : '0ms')); delete _timers[k]; },",
+  "    group: function(){ push(arguments); },",
+  "    groupEnd: function(){},",
+  "    clear: function(){}",
+  "  };",
   "  var fakeAlert = function(x) { logs.push('[alert] ' + String(x)); };",
   "  var fakePrompt = function(q) { logs.push('[prompt] ' + String(q || '') + ' (a web page sandbox cannot ask questions, so the code got an empty answer)'); return ''; };",
   "  var fakeConfirm = function(q) { logs.push('[confirm] ' + String(q || '') + ' (answered OK automatically)'); return true; };",
@@ -549,7 +571,7 @@ async function execute(isRetry) {
         : '';
       return;
     }
-    var failed = !res.ok || !!res.error;
+    var failed = !res.ok;
     lastStderr = res.ok ? (res.error || '') : (res.error || 'Unknown error');
     if (res.ok && !res.error) {
       out.innerHTML = res.output ? '<span class="ok">' + esc(res.output) + '</span>' : '(no output)';
@@ -557,7 +579,7 @@ async function execute(isRetry) {
       out.innerHTML = (res.output ? '<span class="ok">' + esc(res.output) + '</span>\n' : '') +
         '<span class="err">' + esc(lastStderr) + '</span>';
     }
-    if (res.note && !failed && !isRetry) {
+    if (res.note && !isRetry) {
       notesEl.innerHTML = esc(res.note);
     }
     // Automatic fix: on failure, try rule-based repair first, then free AI, then re-run once.
